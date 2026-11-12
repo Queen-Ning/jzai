@@ -35,6 +35,9 @@ const SHARED_TABLE_WHITELIST = new Set([
   'jz_kb_spaces',
   'jz_kb_documents',
   'jz_kb_document_references',
+  'jz_kb_category_access',
+  'jz_department_members',
+  'jz_workgroup_members',
 ]);
 
 /** IDs of panels seeded by the platform (must not conflict) */

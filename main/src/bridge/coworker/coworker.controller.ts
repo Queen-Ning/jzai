@@ -21,6 +21,7 @@ import { CoWorkerAnalyticsService } from './coworker-analytics.service';
 import { CoWorkerPostMeetingService } from './coworker-post-meeting.service';
 import { UserService, Permission } from '../../user/user.service';
 import { DbService } from '../../db/db.service';
+import { KbAccessService } from '../../knowledge/kb-access.service';
 import { KnowledgeToolsService } from '../../knowledge/tools/knowledge-tools.service';
 import { SkillRegistryService } from '../../capability/skill/skill-registry.service';
 import { CoWorkerAppService } from './coworker-app.service';
@@ -977,7 +978,7 @@ export class CoWorkerController {
               }
             } else {
               // 知识库工具：callTool 返回 { content: string }，需归一为 MCP content block 数组
-              const kbResult = await this.mcpTools.callTool(toolName, toolArguments);
+              const kbResult = await this.mcpTools.callTool(toolName, toolArguments, await this.resolveScopes(req));
               result = {
                 content: [{ type: 'text', text: kbResult?.content ?? '' }],
                 isError: false,
@@ -1033,7 +1034,7 @@ export class CoWorkerController {
       throw new ForbiddenException(`工具 ${body.name} 未授权给此 CoWorker`);
     }
 
-    const result = await this.mcpTools.callTool(body.name, body.arguments || {});
+    const result = await this.mcpTools.callTool(body.name, body.arguments || {}, await this.resolveScopes(req));
     return result;
   }
 
@@ -1138,11 +1139,28 @@ export class CoWorkerController {
   }
 
   /**
+   * 计算当前 CoWorker 绑定账户的知识库可见范围，供 callTool 做分类权限过滤。
+   * 返回 undefined 表示无法确定身份 —— 调用方按空集处理（最严格），不放行任何有分类的文档。
+   */
+  private async resolveScopes(req: any): Promise<string[] | 'ADMIN_ALL' | undefined> {
+    const uid = req?.user?.id;
+    if (!uid) return undefined;
+    try {
+      return await new KbAccessService(this.db).getAccessibleScopesForUser(uid);
+    } catch (err: any) {
+      // fail-closed：查询失败按空集处理（调用方拒绝返回任何有分类的文档），但要留痕，否则线上只能看到「突然全都搜不到」
+      this.logger.warn(`[kb-scopes] 解析 ${uid} 的可读分类失败，按无授权处理: ${err?.message ?? err}`);
+      return undefined;
+    }
+  }
+
+  /**
    * Resolve the CoWorker assignment from the request.
    * For CW proxy endpoints, the JWT contains both user id and coworker id.
    * The coworkerId is included in the JWT claims (via signCoWorkerToken).
    * Falls back to X-Coworker-Id header for backward compatibility.
    */
+
   private async resolveAssignment(req: any): Promise<string> {
     const userId = req.user?.id;
     if (!userId) throw new ForbiddenException('未授权');
@@ -1244,7 +1262,7 @@ export class CoWorkerController {
         return await tool.execute('', params);
       } else {
         // MCP/知识库工具
-        const result = await this.mcpTools.callTool(toolName, params);
+        const result = await this.mcpTools.callTool(toolName, params, await this.resolveScopes(req));
         return { content: [{ type: 'text', text: result }] };
       }
     }).catch(err => {

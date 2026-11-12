@@ -308,9 +308,10 @@ export class KbApiController {
     if (!doc) return null;
     const space = await this.spaces.resolve(doc.space_id);
     if (!space || !this.spaces.canRead(space, caller.userId, caller.isAdmin)) return null;
-    if (!caller.isAdmin && doc.category_id) {
+    if (!caller.isAdmin && doc.owner_user_id !== caller.userId) {
       const scopes = await this.kbAccess.getAccessibleScopesForUser(caller.userId);
-      if (scopes !== 'ADMIN_ALL' && !scopes.includes(String(doc.category_id)) && doc.owner_user_id !== caller.userId) {
+      // 未分类（category_id 为 NULL）同样视为无授权，不再默认放行
+      if (scopes !== 'ADMIN_ALL' && (!doc.category_id || !scopes.includes(String(doc.category_id)))) {
         return null;
       }
     }

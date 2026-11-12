@@ -2,7 +2,7 @@
  * scope 过滤 SQL（移植自 kbs/src/shared/scopes.ts，去除 Fastify 依赖）：
  *   scopes === null        → 不过滤（ADMIN_ALL）
  *   scopes 含 'ADMIN_ALL'  → 不过滤
- *   scopes 为空集           → 仅 category_id IS NULL（公共）或 owner_user_id = 本人
+ *   scopes 为空集           → 仅 owner_user_id = 本人（未分类文档不再默认放行）
  *   其余                    → 上述 + category_id ∈ scopes
  */
 export const ADMIN_ALL = 'ADMIN_ALL';
@@ -30,8 +30,7 @@ export function scopeFilterSql(
   const scopeList = [...scopes];
   return {
     sql:
-      ` AND (${col}category_id IS NULL` +
-      ` OR ${col}category_id::text = ANY($${paramIdx}::text[])` +
+      ` AND (${col}category_id::text = ANY($${paramIdx}::text[])` +
       ` OR ${col}owner_user_id = $${paramIdx + 1})`,
     params: [scopeList, userId],
     nextIdx: paramIdx + 2,
