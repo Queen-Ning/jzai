@@ -71,6 +71,9 @@ function normalizeHostGroup(group: string): string {
 const PLUGIN_ALLOWLIST = [
   'openclaw-weixin', // 个人微信(外部,@tencent-weixin/openclaw-weixin)
   'jianzhi-bridge', // 见智审计/回传桥(内置,enabledByDefault:false)
+  // 钉钉通道(随机自带,与 jianzhi-bridge 一样放在 ~/.openclaw/extensions)
+  // 打包插件没有 install provenance,不加进 allowlist 会被当成未受信任的本地代码告警
+  'dingtalk-connector',
   'duckduckgo', // 网页搜索(内置,无 key provider,供 web_search 工具使用)
   'browser',
   'device-pair',

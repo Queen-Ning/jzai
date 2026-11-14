@@ -166,6 +166,16 @@ const getExtensionsPath = () => {
   return path.join(getOpenClawConfigPath(), 'extensions');
 };
 
+/**
+ * 随安装包分发的插件。启动时无条件覆盖到 ~/.openclaw/extensions，
+ * 保证 OTA 装了新版本后，用户目录里的旧插件也会被替换。
+ * marker 用于判断是否需要复制（比整目录哈希便宜）。
+ */
+const BUNDLED_EXTENSIONS = [
+  { id: 'jianzhi-bridge', marker: 'plugin.js' },
+  { id: 'dingtalk-connector', marker: path.join('dist', 'index.mjs') },
+];
+
 // Token 配置文件路径（用于自动激活）
 const getTokenConfigPath = () => {
   const homeDir = app.getPath('home');
@@ -692,14 +702,16 @@ async function applyEnrollment({ token, mainUrl, workDir }) {
   const extensionsDir = getExtensionsPath();
   fs.mkdirSync(extensionsDir, { recursive: true });
 
-  const sourceBridge = path.join(resourcesPath, 'extensions', 'jianzhi-bridge');
-  const targetBridge = path.join(extensionsDir, 'jianzhi-bridge');
-  if (fs.existsSync(sourceBridge)) {
-    fs.mkdirSync(targetBridge, { recursive: true });
-    copyDirRecursive(sourceBridge, targetBridge);
-    console.log('[Enroll] jianzhi-bridge 插件已复制');
-  } else {
-    console.warn('[Enroll] jianzhi-bridge 源码不存在:', sourceBridge);
+  for (const { id } of BUNDLED_EXTENSIONS) {
+    const source = path.join(resourcesPath, 'extensions', id);
+    if (!fs.existsSync(source)) {
+      console.warn(`[Enroll] ${id} 源码不存在:`, source);
+      continue;
+    }
+    const target = path.join(extensionsDir, id);
+    fs.mkdirSync(target, { recursive: true });
+    copyDirRecursive(source, target);
+    console.log(`[Enroll] ${id} 插件已复制`);
   }
 
   installWeChatPlugin(extensionsDir).catch(err => {
@@ -1321,47 +1333,51 @@ function copyDirRecursive(src, dest) {
 /**
  * 无条件刷新打包内自带的插件到 ~/.openclaw/extensions。
  * enroll() 只在首次激活时复制一次，OTA 装了新客户端也不会更新用户目录下的老插件；
- * 因此每次启动都要用打包版本覆盖，才能让 plugin.js 的修复真正生效。
- * 只处理 jianzhi-bridge —— 微信插件走自己的安装/守护流程。
+ * 因此每次启动都要用打包版本覆盖，才能让插件里的修复真正生效。
+ * 微信插件不在这个列表里 —— 它走自己的安装/守护流程。
  */
 function refreshBundledExtensions() {
-  try {
-    const resourcesPath = process.resourcesPath || path.join(__dirname, '..', 'resources');
-    const source = path.join(resourcesPath, 'extensions', 'jianzhi-bridge');
-    if (!fs.existsSync(source)) {
-      console.warn('[Extensions] 打包资源中缺少 jianzhi-bridge，跳过刷新:', source);
-      return;
+  for (const ext of BUNDLED_EXTENSIONS) {
+    try {
+      refreshOneBundledExtension(ext);
+    } catch (err) {
+      console.error(`[Extensions] 刷新 ${ext.id} 失败:`, err.message);
     }
-    const extensionsDir = getExtensionsPath();
-    fs.mkdirSync(extensionsDir, { recursive: true });
-    const target = path.join(extensionsDir, 'jianzhi-bridge');
-
-    // 用 plugin.js 的 mtime + size 做便宜的差异判定
-    const srcPluginJs = path.join(source, 'plugin.js');
-    const tgtPluginJs = path.join(target, 'plugin.js');
-    let needCopy = true;
-    if (fs.existsSync(srcPluginJs) && fs.existsSync(tgtPluginJs)) {
-      const s = fs.statSync(srcPluginJs);
-      const t = fs.statSync(tgtPluginJs);
-      if (s.size === t.size && Math.abs(s.mtimeMs - t.mtimeMs) < 1000) {
-        needCopy = false;
-      }
-    }
-    if (!needCopy) {
-      console.log('[Extensions] jianzhi-bridge 已是最新，跳过刷新');
-      return;
-    }
-    fs.mkdirSync(target, { recursive: true });
-    copyDirRecursive(source, target);
-    // 对齐 mtime，便于下次判定
-    if (fs.existsSync(srcPluginJs) && fs.existsSync(tgtPluginJs)) {
-      const s = fs.statSync(srcPluginJs);
-      fs.utimesSync(tgtPluginJs, s.atime, s.mtime);
-    }
-    console.log('[Extensions] jianzhi-bridge 已刷新到最新版本');
-  } catch (err) {
-    console.error('[Extensions] 刷新 jianzhi-bridge 失败:', err.message);
   }
+}
+
+function refreshOneBundledExtension({ id, marker }) {
+  const resourcesPath = process.resourcesPath || path.join(__dirname, '..', 'resources');
+  const source = path.join(resourcesPath, 'extensions', id);
+  if (!fs.existsSync(source)) {
+    console.warn(`[Extensions] 打包资源中缺少 ${id}，跳过刷新:`, source);
+    return;
+  }
+  const extensionsDir = getExtensionsPath();
+  fs.mkdirSync(extensionsDir, { recursive: true });
+  const target = path.join(extensionsDir, id);
+
+  // 用入口文件的 mtime + size 做便宜的差异判定
+  const srcMarker = path.join(source, marker);
+  const tgtMarker = path.join(target, marker);
+  if (fs.existsSync(srcMarker) && fs.existsSync(tgtMarker)) {
+    const s = fs.statSync(srcMarker);
+    const t = fs.statSync(tgtMarker);
+    if (s.size === t.size && Math.abs(s.mtimeMs - t.mtimeMs) < 1000) {
+      console.log(`[Extensions] ${id} 已是最新，跳过刷新`);
+      return;
+    }
+  }
+  fs.mkdirSync(target, { recursive: true });
+  copyDirRecursive(source, target);
+  // 对齐 mtime，便于下次判定
+  if (fs.existsSync(srcMarker)) {
+    const s = fs.statSync(srcMarker);
+    try {
+      fs.utimesSync(tgtMarker, s.atime, s.mtime);
+    } catch { /* 目标文件可能尚未落盘，下次启动再对齐 */ }
+  }
+  console.log(`[Extensions] ${id} 已刷新到最新版本`);
 }
 
 // ===== 微信插件安装 =====
