@@ -317,6 +317,12 @@ export class ModelRouterService {
     if (provider === this.cloudProvider || provider === 'openai-completions') {
       return this.cloudApiKey || undefined;
     }
+    // 本地 Ollama 走 OpenAI 兼容接口，不校验 key；但客户端库要求非空，
+    // 缺了会直接抛 "No API key for provider: ollama"，请求根本发不出去。
+    // 同 Claude 本地代理的处理方式：给个哑值。
+    if (provider === 'ollama' || provider === 'local') {
+      return process.env.OLLAMA_API_KEY || 'ollama-local';
+    }
     return undefined;
   }
 

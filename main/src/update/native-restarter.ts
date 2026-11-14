@@ -60,9 +60,24 @@ function killByPidFile(name) {
   fs.rmSync(path.join(runDir, `${name}.pid`), { force: true });
 }
 
-/** 端口当前监听者 pid（lsof 不可用时返回 0 表示"无法判定"，按已释放处理） */
+/**
+ * 端口当前监听者 pid，查不到返回 0。
+ *
+ * Windows 上没有 lsof，必须走 netstat —— 否则 execFileSync 抛错被吞、恒返回 0，
+ * ensurePortFree 会误判端口已释放，新进程启动时 EADDRINUSE 崩溃。
+ * 外部表现就是「升级完成后平台再也打不开」。
+ */
 function listenerPid(port) {
   try {
+    if (process.platform === 'win32') {
+      const out = execFileSync('netstat', ['-ano', '-p', 'TCP'],
+        { encoding: 'utf8', windowsHide: true });
+      for (const line of String(out).split(/\r?\n/)) {
+        const m = line.match(/^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i);
+        if (m && Number(m[1]) === Number(port)) return Number(m[2]) || 0;
+      }
+      return 0;
+    }
     const out = execFileSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'],
       { stdio: ['pipe', 'pipe', 'ignore'] }).toString().trim();
     return out ? Number(out.split('\n')[0]) || 0 : 0;
