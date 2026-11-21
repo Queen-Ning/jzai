@@ -2,14 +2,15 @@
 
 /**
  * P4 移动端"应用"TAB。
- * 数据：useAppEntries()（APP 清单入口）× sidebarPanels（P1 可见性过滤结果）——
+ * 数据：useAppEntries()（GET /api/app-entries，MC12 已按授权、应用与宿主授权状态过滤并排序）
+ * × sidebarPanels（打开面板所需的版本、配对智能体等）——
  * 仅列出 mobile.supported===true 且用户可见的 APP 面板；entryComponent 取
- * mobile.entryComponent ?? PC entryComponent（T4.1 激活链写入）。
+ * mobile.entryComponent ?? PC entryComponent（T4.1 激活链写入）。只读期内的应用带「只读」标记。
  * 挂载复用 DynamicPanelLoader（动态 ESM 与视口无关）；TAB 切换不卸载（keepAlive 语义）。
  */
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useI18n } from '@/i18n';
-import { useAppEntries, appEntryPanelTitle, appDisplayName, type AppEntry } from '@/hooks/useAppEntries';
+import { useAppEntries, appEntryPanelTitle, appDisplayName, appReadonlyHint, type AppEntry } from '@/hooks/useAppEntries';
 import { DynamicPanelLoader, type PanelAgentMessage } from '@/components/DynamicPanelLoader';
 
 interface SidebarPanelLike {
@@ -33,6 +34,8 @@ interface OpenTarget {
   app: AppEntry;
   panel: SidebarPanelLike;
   title: string;
+  /** 面板内路由（MC06：深链或 sdk.nav.open 传入，sdk.nav.setRoute 更新） */
+  route: string | null;
 }
 
 /** 与 Sidebar PanelIcon 同逻辑的迷你实现（img:/app:/emoji 三分支） */
@@ -55,20 +58,30 @@ export default function MobileAppsTab({ panels, onPanelAgentMessage }: Props) {
   const { locale } = useI18n();
   const { apps } = useAppEntries();
   const [open, setOpen] = useState<OpenTarget | null>(null);
+  // 应用清单尚未到达时（如首次加载即带深链）暂存打开请求，清单到达后再打开
+  const pendingOpenRef = useRef<{ panelId: string; route: string | null } | null>(null);
 
-  // P4：agent ui_control navigate（page.tsx 路由）→ 自动打开对应移动面板
+  // P4/MC06：page.tsx 派发 jianzhi:mobile-open-panel（智能体 navigate、深链、sdk.nav.open）→ 自动打开对应移动面板
   useEffect(() => {
-    const handler = (e: Event) => {
-      const { panelId } = (e as CustomEvent).detail ?? {};
-      if (!panelId) return;
+    const tryOpen = (panelId: string, route: string | null): boolean => {
       for (const app of apps) {
         const spec = app.entryPanels.find(p => p.id === panelId);
         const sidebar = panels.find(sp => sp.id === panelId);
         if (spec && sidebar?.mobile?.supported) {
-          setOpen({ app, panel: sidebar, title: appEntryPanelTitle(spec, locale) });
-          return;
+          setOpen({ app, panel: sidebar, title: appEntryPanelTitle(spec, locale), route });
+          return true;
         }
       }
+      return false;
+    };
+    if (pendingOpenRef.current && tryOpen(pendingOpenRef.current.panelId, pendingOpenRef.current.route)) {
+      pendingOpenRef.current = null;
+    }
+    const handler = (e: Event) => {
+      const { panelId, route } = (e as CustomEvent).detail ?? {};
+      if (!panelId) return;
+      const nextRoute = typeof route === 'string' ? route : null;
+      pendingOpenRef.current = tryOpen(panelId, nextRoute) ? null : { panelId, route: nextRoute };
     };
     window.addEventListener('jianzhi:mobile-open-panel', handler);
     return () => window.removeEventListener('jianzhi:mobile-open-panel', handler);
@@ -92,6 +105,9 @@ export default function MobileAppsTab({ panels, onPanelAgentMessage }: Props) {
             <button onClick={() => setOpen(null)}
               className="text-gray-500 active:bg-gray-100 rounded p-2 -ml-2 text-base">←</button>
             <span className="text-sm font-medium truncate">{open.title}</span>
+            {appReadonlyHint(open.app) && (
+              <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 shrink-0">只读</span>
+            )}
           </div>
           <div className="flex-1 min-h-0">
             <DynamicPanelLoader
@@ -106,6 +122,8 @@ export default function MobileAppsTab({ panels, onPanelAgentMessage }: Props) {
                 { id: open.panel.id, sourceAppId: open.panel.sourceAppId, agentId: open.panel.agentId },
                 msg,
               )}
+              route={open.route}
+              onRouteChange={nextRoute => setOpen(prev => (prev ? { ...prev, route: nextRoute } : prev))}
             />
           </div>
         </div>
@@ -124,12 +142,18 @@ export default function MobileAppsTab({ panels, onPanelAgentMessage }: Props) {
                   <div className="flex items-baseline gap-1.5 mb-2">
                     <span className="text-xs font-semibold text-gray-800 truncate">{appDisplayName(app.name, app.appId)}</span>
                     {app.version && <span className="text-[10px] text-gray-400 shrink-0">v{app.version}</span>}
+                    {appReadonlyHint(app) && (
+                      <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 shrink-0">只读</span>
+                    )}
                   </div>
+                  {appReadonlyHint(app) && (
+                    <div className="text-[10px] text-amber-700 -mt-1 mb-2">{appReadonlyHint(app)}</div>
+                  )}
                   <div className="grid grid-cols-2 gap-2">
                     {entries.map(({ spec, sidebar }) => (
                       <button
                         key={sidebar!.id}
-                        onClick={() => setOpen({ app, panel: sidebar!, title: appEntryPanelTitle(spec, locale) })}
+                        onClick={() => setOpen({ app, panel: sidebar!, title: appEntryPanelTitle(spec, locale), route: null })}
                         className="flex items-center gap-2 px-3 py-2.5 rounded-md border border-gray-200 text-sm text-gray-700 active:bg-gray-100 text-left"
                       >
                         <span><PanelIcon icon={spec.icon} /></span>

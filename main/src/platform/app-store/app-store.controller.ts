@@ -2,7 +2,7 @@ import {
   Controller, Get, Put, Post, Delete, Param, Body, Query,
   UseGuards, HttpCode, HttpStatus, HttpException, UploadedFile,
   UseInterceptors, Res, Req, BadRequestException, NotFoundException,
-  ForbiddenException, Logger, Sse, MessageEvent,
+  ForbiddenException, Logger, Sse, MessageEvent, Optional,
 } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import { RequireAdmin } from '../authz/require-permission.decorator';
@@ -18,7 +18,9 @@ import { AppInstallService, ORPHANED_DATABASE_RESOURCES_ERROR } from './services
 import { APP_CONFIG_ARTIFACT_PERMISSION, AppActivationService } from './services/app-activation.service';
 import { AppUninstallService } from './services/app-uninstall.service';
 import { AppUpgradeService } from './services/app-upgrade.service';
-import { AppGrantService } from './services/app-grant.service';
+import {
+  AppGrantService, GRANT_LEVELS, GRANT_TARGET_TYPES, GrantLevel, GrantTargetType,
+} from './services/app-grant.service';
 import { AppMcpExposeService } from './services/app-mcp-expose.service';
 import { AppAuditService } from './services/app-audit.service';
 import { AppStagingService } from './services/app-staging.service';
@@ -26,6 +28,11 @@ import { AppInstallOperationService } from './services/app-install-operation.ser
 import { AppInstanceService } from './services/app-instance.service';
 import { AppAssetService } from './services/app-asset.service';
 import { AppCredentialService } from './services/app-credential.service';
+import { AppLicenseService } from './services/app-license.service';
+import { licenseStateOf } from './services/app-license-runtime.service';
+import {
+  HANDLER_FORMAT, assertAppCallable, assertHandlerDeclared, buildInvocation, getHandlerFunction,
+} from './runtime/handler-invocation';
 import { DynamicModuleLoader } from './runtime/dynamic-module.loader';
 import { CompanionServiceManager } from './runtime/companion-service.manager';
 import { AppLogService, AppLogEntry } from './services/app-log.service';
@@ -60,6 +67,8 @@ export class AppStoreController {
     private readonly companions: CompanionServiceManager,
     private readonly moduleRef: ModuleRef,
     private readonly mcpExpose: AppMcpExposeService,
+    // MC11：离线许可证导入（spec 直构不传时导入接口返回 404）
+    @Optional() private readonly appLicenses?: AppLicenseService,
   ) {}
 
   // ------------------------------------------------------------------
@@ -274,10 +283,27 @@ export class AppStoreController {
     return this.grants.getGrants(appId);
   }
 
+  /** MC12（T-P-20）：按权限项汇总已授权的用户、角色、部门（设置「应用权限」页） */
+  @Get('apps/:appId/grants/summary')
+  async getGrantSummary(@Param('appId') appId: string, @Req() req: any) {
+    this.requireAdmin(req);
+    return this.grants.listGrantsByTarget(appId);
+  }
+
+  /** 写入一条授权（level 为 none 时撤销）；设置「应用权限」页的批量授予逐项调用本接口 */
   @Post('apps/:appId/grants')
   async setGrant(@Param('appId') appId: string, @Body() body: any, @Req() req: any) {
     this.requireAdmin(req);
-    await this.grants.setGrant({ ...body, appId });
+    const permissionId = typeof body?.permissionId === 'string' ? body.permissionId : '';
+    const targetId = typeof body?.targetId === 'string' ? body.targetId.trim() : '';
+    const targetType = body?.targetType as GrantTargetType;
+    const level = (body?.level ?? 'user') as GrantLevel;
+    if (!permissionId || !targetId) throw new BadRequestException('permissionId 与 targetId 不能为空');
+    if (!GRANT_TARGET_TYPES.includes(targetType)) throw new BadRequestException('targetType 只能是 user、role 或 department');
+    if (!GRANT_LEVELS.includes(level)) throw new BadRequestException('level 只能是 user、admin 或 none');
+    const grant = { appId, permissionId, targetType, targetId, level };
+    await this.grants.setGrant(grant);
+    await this.audit.log(appId, 'grant_change', req.user?.id ?? null, { permissionId, targetType, targetId, level });
     return { ok: true };
   }
 
@@ -344,27 +370,21 @@ export class AppStoreController {
     @Req() req: any,
   ) {
     // 格式校验（顺带挡掉 constructor/__proto__/toString 等危险路径）
-    if (!/^[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*$/.test(handler)) {
+    if (!HANDLER_FORMAT.test(handler)) {
       throw new BadRequestException(`Invalid handler format: ${handler}`);
     }
 
     const app = await this.registry.findOne(appId);
     if (!app) throw new NotFoundException(`App ${appId} not found`);
 
-    // 停用排空中拒绝新调用
-    if (this.activation.isDraining(appId)) {
-      throw new HttpException(`App ${appId} is deactivating`, HttpStatus.CONFLICT);
-    }
-    // PLAT-016：伴随服务运行期不健康 → degraded，拒绝新调用（避免产生脏结果）
-    const degraded = this.companions.isDegraded(appId);
-    if (degraded.degraded) {
-      throw new HttpException(`App ${appId} degraded: ${degraded.reason}`, HttpStatus.SERVICE_UNAVAILABLE);
-    }
+    // MC11 授权到期、停用排空、伴随服务降级（与 MC07 待办快捷动作共用，见 runtime/handler-invocation.ts）
+    // 只读期内照常转发，invocation.license 告知应用
+    const license = assertAppCallable(appId, app, {
+      isDraining: id => this.activation.isDraining(id),
+      isDegraded: id => this.companions.isDegraded(id),
+    });
     // 白名单校验
-    const declared = (app.manifest?.backend?.controllers ?? []).flatMap(c => c.handlers ?? []);
-    if (!declared.includes(handler)) {
-      throw new NotFoundException(`Handler ${handler} not declared in manifest`);
-    }
+    assertHandlerDeclared(app, handler);
 
     const principal = this.invocationContexts.fromRequest(req, `app-controller:${appId}`);
     const isAdmin = principal?.permissions.includes('sys:admin') === true;
@@ -382,35 +402,40 @@ export class AppStoreController {
       }
     }
 
-    const moduleRef = this.loader.getModuleRef(appId) as any;
-    const [className, methodName] = handler.split('.');
-    const instance = moduleRef?.controllers?.[className];
-    if (!instance || typeof instance[methodName] !== 'function') {
-      throw new NotFoundException(`Controller ${className}.${methodName} not available for app ${appId}`);
-    }
+    const call = getHandlerFunction(this.loader.getModuleRef(appId), appId, handler);
+    const invocation = buildInvocation(appId, app, principal, license, {
+      toolBridge: () => this.moduleRef.get(ToolBridgeService, { strict: false }),
+      connections: (id, p) => this.connectionBindings.createClient(id, p),
+    });
+    return call(body ?? {}, invocation);
+  }
 
-    const allowedPlatformTools = new Set(app.manifest?.usesPlatformTools ?? []);
-    const tools = Object.freeze({
-      call: async (name: string, params: unknown) => {
-        if (!allowedPlatformTools.has(name)) {
-          throw new ForbiddenException(`Platform tool ${name} is not declared for app ${appId}`);
-        }
-        const toolBridge = this.moduleRef.get(ToolBridgeService, { strict: false });
-        if (!toolBridge) throw new NotFoundException('Platform tool service is unavailable');
-        return toolBridge.callTool(name, params, principal);
-      },
+  // ------------------------------------------------------------------
+  // License（MC11：管理员导入离线许可证文本）
+  // ------------------------------------------------------------------
+
+  /**
+   * POST /api/app-store/apps/:appId/license  body: { license: string }
+   * 验签、绑定与有效期都通过才写入；应用处于到期状态时复查包完整性后恢复运行。无效时 400，状态不变。
+   */
+  @Post('apps/:appId/license')
+  async importLicense(@Param('appId') appId: string, @Body() body: any, @Req() req: any) {
+    this.requireAdmin(req);
+    const app = await this.registry.findOne(appId);
+    if (!app) throw new NotFoundException(`App ${appId} not found`);
+    const blob = typeof body?.license === 'string' ? body.license.trim() : '';
+    if (!blob) throw new BadRequestException('license 不能为空');
+    if (!this.appLicenses) throw new NotFoundException('License service is unavailable');
+    try {
+      await this.appLicenses.verifyForImport(appId, blob);
+    } catch (err: any) {
+      throw new BadRequestException(`许可证无效：${err?.message ?? err}`);
+    }
+    const result = await this.appLicenses.setLicense(appId, blob);
+    await this.audit.log(appId, 'license_import', req.user?.id ?? null, {
+      status: result.status, restored: result.restored, expiresAt: result.expiresAt, reason: result.reason ?? null,
     });
-    const invocation = Object.freeze({
-      appId,
-      requestId: crypto.randomUUID(),
-      principal,
-      userId: principal?.userId,
-      roleIds: principal?.roleIds ?? [],
-      permissions: principal?.permissions ?? [],
-      tools,
-      connections: this.connectionBindings.createClient(appId, principal),
-    });
-    return instance[methodName](body ?? {}, invocation);
+    return { ok: true, ...result };
   }
 
   // ------------------------------------------------------------------
@@ -451,8 +476,9 @@ export class AppStoreController {
     await this.registry.updateConfig(appId, config);
     await this.audit.log(appId, 'config_update', req.user?.id ?? null, { keys: Object.keys(config) });
     // secret/配置更新后重载 backend，使解析后的新值生效
-    if (app.status === 'active' && app.installDir) {
-      this.activation.deactivateApp(appId);
+    if ((app.status === 'active' || licenseStateOf(app).state === 'readonly') && app.installDir) {
+      // 必须等停用完成再激活：否则伴随服务与独立进程后端会与新实例并存（T-P-14 修复竞态）
+      await this.activation.deactivateApp(appId);
       await this.activation.activateApp(appId, app.installDir, app.manifest);
     }
     return { ok: true };

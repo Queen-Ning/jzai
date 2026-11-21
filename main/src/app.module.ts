@@ -22,6 +22,9 @@ import { EmailModule } from './platform/email/email.module';
 import { AppStoreModule } from './platform/app-store/app-store.module';
 import { AuthzModule } from './platform/authz/authz.module';
 import { SchedulerModule } from './platform/scheduler/scheduler.module';
+import { SystemModule } from './platform/system/system.module';
+import { InboxModule } from './platform/inbox/inbox.module';
+import { SandboxModule } from './platform/sandbox/sandbox.module';
 
 // Agent engine
 import { AgentModule } from './agent/agent.module';
@@ -54,6 +57,7 @@ import { AppBootstrapService } from './app-bootstrap.service';
     AppConfigModule, CacheModule, WorkspaceModule, DbModule, AuthzModule, SchedulerModule,
     UserModule, AuthModule, ModelRouterModule, AnalyticsModule,
     EditionModule, SetupModule, UpdateModule, PanelModule, OemModule, EmailModule, AppStoreModule,
+    SystemModule, InboxModule, SandboxModule,
     // Agent engine
     AgentModule, MessageDisplayModule,
     // Capability

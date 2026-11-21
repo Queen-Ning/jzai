@@ -2,13 +2,42 @@ import { Injectable, Logger, NotFoundException, BadRequestException } from '@nes
 import { DbService } from '../../../db/db.service';
 import { AppRegistryService } from './app-registry.service';
 import type { InvocationPrincipal } from '../runtime/invocation-principal';
+import { PERMISSION_GROUPS, PermissionGroup } from '../validators/manifest.schema';
 
 export type GrantLevel = 'none' | 'user' | 'admin';
+export type GrantTargetType = 'user' | 'department' | 'role';
+export const GRANT_TARGET_TYPES: readonly GrantTargetType[] = ['user', 'role', 'department'];
+export const GRANT_LEVELS: readonly GrantLevel[] = ['none', 'user', 'admin'];
+
+/** 已授权对象（MC12「应用权限」页）：name 为空表示对象已删除，界面显示 id */
+export interface PermissionGrantTarget {
+  id: string;
+  name: string | null;
+  level: Exclude<GrantLevel, 'none'>;
+}
+
+/** 一个权限项及其已授权的用户、角色、部门（listGrantsByTarget） */
+export interface PermissionGrantSummary {
+  id: string;
+  label: { zh: string; en?: string };
+  description?: { zh: string; en?: string };
+  /** manifest 未写或写了无法识别的值时为 other */
+  group: PermissionGroup;
+  default?: 'user' | 'admin' | 'none';
+  /**
+   * 权限项已从 manifest 删除，但库中仍有授权记录。这些记录对未声明权限的面板、handler 与工具仍算作
+   * 「持有该应用的授权」，因此照样列出，供管理员撤销（只能撤销，不能新授予）。
+   */
+  undeclared?: true;
+  users: PermissionGrantTarget[];
+  roles: PermissionGrantTarget[];
+  departments: PermissionGrantTarget[];
+}
 
 export interface AppGrant {
   appId: string;
   permissionId: string;
-  targetType: 'user' | 'department' | 'role';
+  targetType: GrantTargetType;
   targetId: string;
   level: GrantLevel;
 }
@@ -37,12 +66,77 @@ export class AppGrantService {
     }));
   }
 
+  /**
+   * MC12（T-P-20）：按权限项汇总已授权的用户、角色、部门，供设置「应用权限」页显示。
+   * - 列出 manifest 声明的全部权限项（含未授权的，三个列表为空）；
+   * - 已从 manifest 删除但仍有授权记录的权限项带 undeclared 标记排在最后（它们仍赋予应用级访问，须能看到并撤销）；
+   * - 按分组顺序（function、operation、scope、field、other）排列，组内保持 manifest 中的先后；
+   * - 对象按授权时间排列；不展开角色与部门成员（成员展开见 host.listPermissionHolders）。
+   */
+  async listGrantsByTarget(appId: string): Promise<PermissionGrantSummary[]> {
+    const app = await this.registry.findOne(appId);
+    if (!app) throw new NotFoundException(`App ${appId} not found`);
+
+    const groupOrder = new Map<string, number>(PERMISSION_GROUPS.map((g, i) => [g, i]));
+    const summaries = new Map<string, PermissionGrantSummary>();
+    const declared = (app.manifest?.permissions ?? []).map((p, index) => ({ p, index }));
+    for (const { p } of declared) {
+      if (summaries.has(p.id)) continue;
+      summaries.set(p.id, {
+        id: p.id,
+        label: p.label,
+        ...(p.description ? { description: p.description } : {}),
+        group: (p.group && groupOrder.has(p.group) ? p.group : 'other') as PermissionGroup,
+        ...(p.default ? { default: p.default } : {}),
+        users: [],
+        roles: [],
+        departments: [],
+      });
+    }
+    const res = await this.db.query(
+      `SELECT g.permission_id AS "permissionId", g.target_type AS "targetType", g.target_id AS "targetId", g.level,
+              CASE g.target_type
+                WHEN 'user' THEN COALESCE(NULLIF(u.name, ''), u.username)
+                WHEN 'role' THEN r.name
+                ELSE d.name
+              END AS "targetName"
+       FROM jz_app_grants g
+       LEFT JOIN jz_users u ON g.target_type = 'user' AND u.id = g.target_id
+       LEFT JOIN jz_roles r ON g.target_type = 'role' AND r.id = g.target_id
+       LEFT JOIN jz_departments d ON g.target_type = 'department' AND d.id = g.target_id
+       WHERE g.app_id = $1 AND g.level <> 'none'
+       ORDER BY g.created_at, g.target_id`,
+      [appId],
+    );
+    const listOf = { user: 'users', role: 'roles', department: 'departments' } as const;
+    const undeclared = new Map<string, PermissionGrantSummary>();
+    for (const row of res.rows) {
+      const key = listOf[row.targetType as GrantTargetType];
+      if (!key) continue;
+      let summary = summaries.get(row.permissionId) ?? undeclared.get(row.permissionId);
+      if (!summary) {
+        summary = {
+          id: row.permissionId, label: { zh: row.permissionId }, group: 'other', undeclared: true,
+          users: [], roles: [], departments: [],
+        };
+        undeclared.set(row.permissionId, summary);
+      }
+      summary[key].push({ id: row.targetId, name: row.targetName ?? null, level: row.level });
+    }
+
+    const indexOf = new Map(declared.map(({ p, index }) => [p.id, index]));
+    const sorted = [...summaries.values()].sort((a, b) =>
+      groupOrder.get(a.group)! - groupOrder.get(b.group)! || indexOf.get(a.id)! - indexOf.get(b.id)!);
+    return [...sorted, ...[...undeclared.values()].sort((a, b) => a.id.localeCompare(b.id))];
+  }
+
   async setGrant(grant: AppGrant): Promise<void> {
     const app = await this.registry.findOne(grant.appId);
     if (!app) throw new NotFoundException(`App ${grant.appId} not found`);
 
     const declared = app.manifest?.permissions?.map(p => p.id) ?? [];
-    if (!declared.includes(grant.permissionId)) {
+    // 撤销（level none）不要求权限项仍在 manifest 中：升级删掉的权限项留下的授权记录须能撤销（MC12）
+    if (!declared.includes(grant.permissionId) && grant.level !== 'none') {
       throw new BadRequestException(`Permission ${grant.permissionId} not declared in manifest`);
     }
 

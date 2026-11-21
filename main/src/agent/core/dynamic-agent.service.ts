@@ -577,7 +577,7 @@ export class DynamicAgentService implements OnModuleInit {
         unsubscribe();
         this.agentPool.remove(agentKey);
         this.contextManager.removeSession(agentKey);
-        agent = await this.getOrCreateAgent(agentDef, 'fresh_' + Date.now(), userId, userEmail, principal);
+        agent = await this.getOrCreateAgent(agentDef, 'fresh_' + Date.now(), userId, userEmail, principal, sessionId);
         unsubscribe = agent.subscribe(async (event: PiAgentEvent) => {
           const now = Date.now();
           lastEventTime = now;
@@ -801,6 +801,8 @@ export class DynamicAgentService implements OnModuleInit {
     userId: string,
     userEmail?: string,
     principal?: InvocationPrincipal,
+    /** 工具所在的会话号（人工确认路由用）；上下文硬重置时 agent 换成 fresh_* 键，会话号仍是原会话 */
+    toolSessionId: string = sessionId,
   ): Promise<any> {
     const key = `${def.id}_${sessionId}`;
     if (this.agentPool.has(key)) return this.agentPool.get(key)!;
@@ -808,7 +810,7 @@ export class DynamicAgentService implements OnModuleInit {
     const model = this.modelRouter.resolveModelForLevel(def.modelLevel);
     const tools = await this.toolBridge.buildForAgent(
       def.tools,
-      { principal, userId, agentKey: key, userEmail, appId: this.registry.getOwnerAppId(def.id) },
+      { principal, userId, agentKey: key, sessionId: toolSessionId, userEmail, appId: this.registry.getOwnerAppId(def.id) },
       def.context?.maxToolOutputChars,
     );
 

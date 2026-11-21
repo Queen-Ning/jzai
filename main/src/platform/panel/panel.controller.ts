@@ -27,6 +27,15 @@ export class PanelController {
     return this.panelService.getUserSidebar(user.id, permissions);
   }
 
+  /** MC12（T-P-19）：当前用户的「应用」入口，按授权、应用与宿主的授权状态过滤 */
+  @Get('app-entries')
+  async getAppEntries(@Headers('authorization') auth: string) {
+    const user = this.extractUser(auth);
+    if (!user) throw new UnauthorizedException();
+    const permissions = user.role?.permissions || [];
+    return this.panelService.getUserAppEntries(user.id, permissions);
+  }
+
   @Put('sidebar')
   async saveSidebar(
     @Headers('authorization') auth: string,

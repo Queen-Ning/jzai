@@ -126,6 +126,14 @@ export const AppManifestSchema = z.object({
   license: z.string().optional(),
   /** 需要订阅 License 才能运行（无有效 License 安装后进入 license_expired 状态） */
   requiresLicense: z.boolean().optional(),
+  /**
+   * MC11：授权到期后的处理。deactivate（默认）立即停用后端；readonly 时后端保持运行 readonlyDays 天，
+   * 期间应用收到 onLicenseChange('readonly') 并自行拒绝写入，期满后停用。readonly 只开放给首方应用。
+   */
+  licensePolicy: z.object({
+    onExpired: z.enum(['deactivate', 'readonly']).optional(),
+    readonlyDays: z.number().int().min(0).max(90).optional(),
+  }).optional(),
   icon: z.string().optional(),
   tags: z.array(z.string()).optional(),
   engines: z
@@ -143,7 +151,8 @@ export const AppManifestSchema = z.object({
         }),
       sharedTablesRead: z.array(z.string()).optional(),
       statementTimeoutMs: z.number().int().positive().max(60000).optional().default(30000),
-      poolMax: z.number().int().positive().max(5).optional().default(3),
+      // MC03：上限 20 只开放给首方包；第三方包超过 5 由校验器以 POOL_MAX_NOT_FIRST_PARTY 拒绝
+      poolMax: z.number().int().positive().max(20).optional().default(3),
     })
     .optional(),
   permissions: z
@@ -151,6 +160,13 @@ export const AppManifestSchema = z.object({
       z.object({
         id: z.string(),
         label: i18nStringSchema,
+        /** 说明（MC12）：显示在设置「应用权限」页 */
+        description: i18nStringSchema.optional(),
+        /**
+         * 分组（MC12）：function、operation、scope、field、other，供设置「应用权限」页分组显示；不写按 other。
+         * schema 只要求字符串，取值由校验器以 PERM_GROUP_INVALID 检查（不中断其他检查，并给出修改提示）。
+         */
+        group: z.string().optional(),
         default: z.enum(['user', 'admin', 'none']).optional(),
       }),
     )
@@ -180,6 +196,20 @@ export const AppManifestSchema = z.object({
       module: z.string(),
       toolProviders: z.array(toolProviderSchema).optional(),
       controllers: z.array(controllerSchema).optional(),
+      /**
+       * 后端运行方式（MC09）：缺省 in-process（与主台同进程）；process 为主台拉起的独立子进程，
+       * 仅首方包可用。注意与伴随服务 services[].runtime 的 'process'（包内长驻服务）不是一回事。
+       */
+      runtime: z.enum(['in-process', 'process']).optional(),
+      /** 独立进程的资源与监管参数，仅 runtime 为 process 时生效 */
+      process: z
+        .object({
+          memoryMb: z.number().int().positive().max(8192).optional(),
+          shutdownGraceSec: z.number().int().positive().max(120).optional(),
+          heartbeatSec: z.number().int().positive().max(60).optional(),
+          maxRestarts: z.number().int().positive().max(20).optional(),
+        })
+        .optional(),
     })
     .optional(),
   panels: z.array(panelSchema).optional(),
@@ -204,6 +234,23 @@ export const AppManifestSchema = z.object({
       ),
     })
     .optional(),
+  /**
+   * 消息与待办中心（MC07）：actionHandler 为待办快捷动作的回调（"Class.method"，须在 backend.controllers[].handlers 中，
+   * 校验器以 INBOX_ACTION_HANDLER_UNKNOWN 检查）；写入消息与待办另需 platformCapabilities 含 inbox:publish。
+   */
+  inbox: z
+    .object({
+      actionHandler: z.string().optional(),
+    })
+    .optional(),
 });
 
 export type AppManifest = z.infer<typeof AppManifestSchema>;
+
+/** MC12：permissions[].group 的取值与显示顺序（审批与联动调整归 operation） */
+export const PERMISSION_GROUPS = ['function', 'operation', 'scope', 'field', 'other'] as const;
+export type PermissionGroup = (typeof PERMISSION_GROUPS)[number];
+
+/** 单个应用的权限项上限（30 §3.10）：超过 300 警告，超过 500 拒绝 */
+export const PERMISSION_COUNT_WARN = 300;
+export const PERMISSION_COUNT_MAX = 500;

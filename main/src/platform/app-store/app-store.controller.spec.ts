@@ -143,15 +143,54 @@ describe('AppStoreController', () => {
     it('uses the route appId when a grant body contains a different appId', async () => {
       await controller.setGrant(
         'com.example.route-app',
-        { appId: 'com.example.body-app', userId: 'user-1', granted: true },
+        { appId: 'com.example.body-app', permissionId: 'ex:use', targetType: 'user', targetId: 'user-1', level: 'user' },
         adminReq,
       );
 
       expect(grants.setGrant).toHaveBeenCalledWith({
         appId: 'com.example.route-app',
-        userId: 'user-1',
-        granted: true,
+        permissionId: 'ex:use',
+        targetType: 'user',
+        targetId: 'user-1',
+        level: 'user',
       });
+    });
+
+    // T-P-20（MC12）：授权写入校验请求体并写审计；汇总接口只给管理员
+    it('validates the grant body and writes a grant_change audit entry per write', async () => {
+      const bad = [
+        {},
+        { permissionId: 'ex:use', targetType: 'group', targetId: 'g1' },
+        { permissionId: 'ex:use', targetType: 'user', targetId: ' ' },
+        { permissionId: 'ex:use', targetType: 'user', targetId: 'u1', level: 'owner' },
+      ];
+      for (const body of bad) {
+        await expect(controller.setGrant('com.example.app', body, adminReq)).rejects.toBeInstanceOf(BadRequestException);
+      }
+      expect(grants.setGrant).not.toHaveBeenCalled();
+      expect(audit.log).not.toHaveBeenCalled();
+
+      await controller.setGrant('com.example.app', { permissionId: 'ex:use', targetType: 'role', targetId: 'r1' }, adminReq);
+      expect(grants.setGrant).toHaveBeenCalledWith(expect.objectContaining({ targetType: 'role', targetId: 'r1', level: 'user' }));
+      await controller.setGrant('com.example.app', { permissionId: 'ex:use', targetType: 'role', targetId: 'r1', level: 'none' }, adminReq);
+      expect(audit.log).toHaveBeenNthCalledWith(1, 'com.example.app', 'grant_change', 'admin-user',
+        { permissionId: 'ex:use', targetType: 'role', targetId: 'r1', level: 'user' });
+      expect(audit.log).toHaveBeenNthCalledWith(2, 'com.example.app', 'grant_change', 'admin-user',
+        { permissionId: 'ex:use', targetType: 'role', targetId: 'r1', level: 'none' });
+    });
+
+    it('does not write an audit entry when the service rejects the grant', async () => {
+      grants.setGrant.mockRejectedValueOnce(new BadRequestException('Permission ex:x not declared in manifest'));
+      await expect(controller.setGrant('com.example.app', { permissionId: 'ex:x', targetType: 'user', targetId: 'u1' }, adminReq))
+        .rejects.toBeInstanceOf(BadRequestException);
+      expect(audit.log).not.toHaveBeenCalled();
+    });
+
+    it.each(nonAdminRequests)('rejects the grant summary for non-admins', async req => {
+      grants.listGrantsByTarget = jest.fn();
+      await expect(Promise.resolve().then(() => controller.getGrantSummary('com.example.app', req)))
+        .rejects.toBeInstanceOf(ForbiddenException);
+      expect(grants.listGrantsByTarget).not.toHaveBeenCalled();
     });
   });
 
@@ -282,6 +321,96 @@ describe('AppStoreController', () => {
 
       expect(message).toBe('应用配置目录权限不足。请由管理员清理或修复旧的挂载配置文件后重试。');
       expect(message).not.toContain('数据库权限');
+    });
+  });
+
+  // T-P-18（MC11）：到期调用拦截、只读期透传与离线许可证导入
+  describe('license (MC11 / T-P-18)', () => {
+    let appLicenses: any;
+    let licensed: AppStoreController;
+    const run = jest.fn();
+    const paidApp = (extra: Record<string, unknown> = {}) => ({
+      appId: 'com.example.app',
+      status: 'active',
+      manifest: { requiresLicense: true, backend: { controllers: [{ handlers: ['ProbeController.run'] }] } },
+      config: {},
+      ...extra,
+    });
+
+    beforeEach(() => {
+      run.mockReset().mockResolvedValue({ ok: true });
+      appLicenses = {
+        verifyForImport: jest.fn().mockResolvedValue({ expiresAt: new Date('2027-01-01T00:00:00Z') }),
+        setLicense: jest.fn().mockResolvedValue({ status: 'active', restored: true, expiresAt: '2027-01-01T00:00:00.000Z', expired: false }),
+      };
+      loader.getModuleRef.mockReturnValue({ controllers: { ProbeController: { run } } });
+      licensed = new AppStoreController(
+        registry, {} as any, uninstall, upgrade, grants, audit, staging, operations, instances, {} as any,
+        { maskConfig: jest.fn((c: any) => c), extractAndStoreSecrets: jest.fn((_id: string, c: any) => Promise.resolve(c)) } as any,
+        { deactivateApp: jest.fn(), activateApp: jest.fn().mockResolvedValue(undefined), isDraining: jest.fn().mockReturnValue(false) } as any,
+        loader, appLogs, new InvocationContextFactory(), connectionBindings,
+        { isDegraded: jest.fn().mockReturnValue({ degraded: false }), listServices: jest.fn().mockReturnValue([]) } as any,
+        moduleRef,
+        undefined as any,
+        appLicenses,
+      );
+    });
+
+    // T-P-18-C08（调用侧）
+    it('rejects invoke with 403 APP_LICENSE_EXPIRED when the license expired and no read-only period applies', async () => {
+      registry.findOne.mockResolvedValue(paidApp({ status: 'license_expired', licenseReadonlyUntil: null }));
+      const err = await licensed.invokeHandler('com.example.app', 'ProbeController.run', {}, adminReq).catch(e => e);
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as ForbiddenException).getResponse()).toEqual(expect.objectContaining({ code: 'APP_LICENSE_EXPIRED' }));
+      expect(run).not.toHaveBeenCalled();
+    });
+
+    it('rejects invoke after the read-only period has ended', async () => {
+      registry.findOne.mockResolvedValue(paidApp({ status: 'license_expired', licenseReadonlyUntil: new Date(Date.now() - 1000) }));
+      const err = await licensed.invokeHandler('com.example.app', 'ProbeController.run', {}, adminReq).catch(e => e);
+      expect((err as ForbiddenException).getResponse()).toEqual(expect.objectContaining({ code: 'APP_LICENSE_EXPIRED' }));
+    });
+
+    it('forwards invoke during the read-only period and tells the app via invocation.license', async () => {
+      const until = new Date(Date.now() + 7 * 86_400_000);
+      registry.findOne.mockResolvedValue(paidApp({ status: 'license_expired', licenseReadonlyUntil: until }));
+      await expect(licensed.invokeHandler('com.example.app', 'ProbeController.run', {}, adminReq)).resolves.toEqual({ ok: true });
+      expect(run).toHaveBeenCalledWith({}, expect.objectContaining({
+        license: { state: 'readonly', readonlyUntil: until.toISOString() },
+      }));
+    });
+
+    it('passes a valid license snapshot for an active app', async () => {
+      registry.findOne.mockResolvedValue(paidApp());
+      await licensed.invokeHandler('com.example.app', 'ProbeController.run', {}, adminReq);
+      expect(run).toHaveBeenCalledWith({}, expect.objectContaining({ license: { state: 'valid', readonlyUntil: null } }));
+    });
+
+    // T-P-18-C08（导入侧）
+    it('imports a valid license as admin, restores the app and writes an audit entry', async () => {
+      registry.findOne.mockResolvedValue(paidApp({ status: 'license_expired' }));
+      await expect(licensed.importLicense('com.example.app', { license: '  blob  ' }, adminReq))
+        .resolves.toEqual(expect.objectContaining({ ok: true, status: 'active', restored: true }));
+      expect(appLicenses.verifyForImport).toHaveBeenCalledWith('com.example.app', 'blob');
+      expect(appLicenses.setLicense).toHaveBeenCalledWith('com.example.app', 'blob');
+      expect(audit.log).toHaveBeenCalledWith('com.example.app', 'license_import', 'admin-user', expect.objectContaining({ restored: true }));
+    });
+
+    it('rejects an invalid license with 400 and leaves the stored license unchanged', async () => {
+      registry.findOne.mockResolvedValue(paidApp({ status: 'license_expired' }));
+      appLicenses.verifyForImport.mockRejectedValue(new Error('signature mismatch'));
+      await expect(licensed.importLicense('com.example.app', { license: 'bad' }, adminReq)).rejects.toBeInstanceOf(BadRequestException);
+      await expect(licensed.importLicense('com.example.app', {}, adminReq)).rejects.toBeInstanceOf(BadRequestException);
+      expect(appLicenses.setLicense).not.toHaveBeenCalled();
+      expect(audit.log).not.toHaveBeenCalled();
+    });
+
+    it.each(nonAdminRequests)('rejects license import for non-admins before any side effect', async req => {
+      await expect(Promise.resolve().then(() => licensed.importLicense('com.example.app', { license: 'blob' }, req)))
+        .rejects.toBeInstanceOf(ForbiddenException);
+      expect(registry.findOne).not.toHaveBeenCalled();
+      expect(appLicenses.verifyForImport).not.toHaveBeenCalled();
+      expect(appLicenses.setLicense).not.toHaveBeenCalled();
     });
   });
 });

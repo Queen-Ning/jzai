@@ -13,7 +13,7 @@ describe('AppInstallOperationService', () => {
     service.setStageDir(operation.stageId, '/tmp/jzapp-stage');
     service.setReady(
       operation.stageId,
-      { appId: 'com.menhu.drawing.dimtuner', version: '1.0.0', name: { zh: '图纸识别' } },
+      { appId: 'com.example.drawing.dimtuner', version: '1.0.0', name: { zh: '图纸识别' } },
       ['示例警告'],
     );
 

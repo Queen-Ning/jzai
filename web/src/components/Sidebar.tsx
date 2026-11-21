@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { useI18n } from '@/i18n';
 import { getMainUrl } from '@/lib/env';
 import type { SidebarPanel } from '@/hooks/useSidebar';
-import { useAppEntries, appEntryPanelTitle, appDisplayName } from '@/hooks/useAppEntries';
+import { useAppEntries, appEntryPanelTitle, appDisplayName, appEntryDescription, appReadonlyHint } from '@/hooks/useAppEntries';
 
 const MAIN_URL = getMainUrl();
 
@@ -192,21 +192,26 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
 
         {appMenuOpen && (() => {
           const activeApps = installedApps;
-          const panelTitle = (p: { id: string; name?: { zh?: string; en?: string } }) => appEntryPanelTitle(p as any, locale);
+          const panelTitle = (p: { id: string; name?: { zh?: string; en?: string } }) => appEntryPanelTitle(p, locale);
           return (
             <div ref={appMenuRef} className="fixed bg-white border border-gray-200 rounded-xl shadow-xl z-50 p-3 w-[520px] max-w-[90vw] max-h-[70vh] overflow-y-auto"
               style={{ top: appMenuPos.top, left: appMenuPos.left }}>
               <div className="text-[10px] text-gray-400 px-1 pb-2">{panelName(appsPanel!)}</div>
               {activeApps.length === 0 ? (
-                <div className="px-3 py-2 text-xs text-gray-400">暂无已安装应用</div>
+                <div className="px-3 py-2 text-xs text-gray-400">暂无可用的应用</div>
               ) : (
                 <div className="flex flex-wrap gap-2.5">
-                  {activeApps.map(app => (
+                  {activeApps.map(app => {
+                    const readonlyHint = appReadonlyHint(app);
+                    return (
                     <div key={app.appId} className="flex-1 min-w-[210px] max-w-full bg-white border border-gray-200 rounded-lg p-2.5">
-                      {/* APP 分组头（灰底标题区） */}
+                      {/* APP 分组头（灰底标题区）；MC12：授权只读期内显示「只读」标记 */}
                       <div className="flex items-baseline gap-1.5 -mx-2.5 -mt-2.5 px-3.5 py-2 mb-1.5 bg-gray-50 border-b border-gray-200 rounded-t-lg" title={app.appId}>
                         <span className="text-xs font-semibold text-gray-800 truncate">{appDisplayName(app.name, app.appId)}</span>
                         <span className="text-[10px] text-gray-400 shrink-0">v{app.version}</span>
+                        {readonlyHint && (
+                          <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 shrink-0" title={readonlyHint}>只读</span>
+                        )}
                       </div>
                       {/* 功能入口（一个 APP 可多个） */}
                       <div className="flex flex-wrap gap-1">
@@ -217,7 +222,7 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
                             className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-sm hover:bg-gray-100 transition-all ${
                               active === panel.id ? 'text-indigo-600 bg-gray-100' : 'text-gray-600'
                             }`}
-                            title={panel.description || app.description}
+                            title={appEntryDescription(app, locale)}
                           >
                             <span className="shrink-0"><PanelIcon icon={panel.icon || '📦'} size={16} /></span>
                             <span className="truncate max-w-[140px]">{panelTitle(panel)}</span>
@@ -225,7 +230,8 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
                         ))}
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>

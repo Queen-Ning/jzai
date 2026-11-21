@@ -4,6 +4,7 @@ import { WorkspaceModule } from '../../workspace/workspace.module';
 import { SkillModule } from '../../capability/skill/skill.module';
 import { McpRegistryModule } from '../../capability/mcp/mcp-registry.module';
 import { KnowledgeModule } from '../../knowledge/knowledge.module';
+import { AuthzModule } from '../authz/authz.module';
 import { AppCapabilityModule } from './app-capability.module';
 import { AppRegistryService } from './services/app-registry.service';
 import { AppSchemaService } from './services/app-schema.service';
@@ -19,6 +20,7 @@ import { AppAuditService } from './services/app-audit.service';
 import { AppCredentialService } from './services/app-credential.service';
 import { AppStagingService } from './services/app-staging.service';
 import { AppLicenseService } from './services/app-license.service';
+import { AppLicenseRuntimeService } from './services/app-license-runtime.service';
 import { PackageSignatureService } from './services/package-signature.service';
 import { BuiltinAppSeedService } from './services/builtin-app-seed.service';
 import { SafeArchiveService } from './services/safe-archive.service';
@@ -35,7 +37,8 @@ import { AppValidatorService } from './validators/app-validator.service';
 import { AppActivationService } from './services/app-activation.service';
 import { IsolationService } from './runtime/isolation.service';
 import { DynamicModuleLoader } from './runtime/dynamic-module.loader';
-import { CompanionServiceManager } from './runtime/companion-service.manager';
+import { BACKEND_PROCESS_STATUS, CompanionServiceManager } from './runtime/companion-service.manager';
+import { ProcessRuntimeService } from './runtime/process/process-runtime.service';
 import { InvocationContextFactory } from './runtime/invocation-context.factory';
 import { AppStoreController } from './app-store.controller';
 import { AppKbProxyController } from './app-kb-proxy.controller';
@@ -43,7 +46,8 @@ import { AppConnectionBindingController } from './app-connection-binding.control
 import { AppServicePrincipalController } from './app-service-principal.controller';
 
 @Module({
-  imports: [DbModule, WorkspaceModule, SkillModule, McpRegistryModule, AppCapabilityModule, KnowledgeModule],
+  // AuthzModule：DevMcpService 的 ResourceAccessService 是 @Optional 注入，不导入则为 undefined、工具授权检查不执行（MC01）
+  imports: [DbModule, WorkspaceModule, SkillModule, McpRegistryModule, AppCapabilityModule, KnowledgeModule, AuthzModule],
   controllers: [
     AppStoreController,
     AppKbProxyController,
@@ -69,11 +73,15 @@ import { AppServicePrincipalController } from './app-service-principal.controlle
     SafeArchiveService,
     AppStagingService,
     AppLicenseService,
+    // MC11：订阅授权与运行联动（到期停用、只读期、续订恢复）
+    AppLicenseRuntimeService,
     PackageSignatureService,
     BuiltinAppSeedService,
     AppInstanceService,
     AppActivationService,
     IsolationService,
+    ProcessRuntimeService,
+    { provide: BACKEND_PROCESS_STATUS, useExisting: ProcessRuntimeService },
     DynamicModuleLoader,
     CompanionServiceManager,
     InvocationContextFactory,
@@ -100,7 +108,10 @@ import { AppServicePrincipalController } from './app-service-principal.controlle
     AppPlatformService,
     AppConnectionBindingService,
     AppLicenseService,
+    AppLicenseRuntimeService,
     PackageSignatureService,
+    // MC07：InboxModule 写快捷动作审计
+    AppAuditService,
   ],
 })
 export class AppStoreModule {}

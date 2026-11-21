@@ -3,6 +3,8 @@ import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
 import { AgentRegistryService } from '../../agent/core/agent-registry.service';
 import { ResourceAccessService } from '../authz/resource-access.service';
 import { createUserPrincipal } from '../app-store/runtime/invocation-principal';
+import { hostAppIdOf, isAppUsable, licenseStateOf } from '../app-store/app-state';
+import type { AppLicenseSnapshot } from '../app-store/runtime/process/protocol';
 import { DbService } from '../../db/db.service';
 import { WorkspaceService } from '../../workspace/workspace.service';
 import * as fs from 'fs';
@@ -16,6 +18,80 @@ const SEED_PANELS = [
   { id: 'apps',          name: '应用',      icon: 'img:/icons/apps.svg',        permission: 'nav:apps',       isBuiltin: false, sortOrder: 8, category: 'builtin', agentId: null },
   { id: 'cfg',           name: '设置',      icon: '⚙',                          permission: 'nav:settings',   isBuiltin: true,  sortOrder: 9, category: 'system',  agentId: null },
 ];
+
+/**
+ * 面板授权判定（侧栏与「应用」入口共用，MC12：两处同一规则，避免入口与可打开的面板不一致）。
+ * 要求外层查询别名 jz_panels 为 p，$1 为 userId；结果列 g.level 非空即有授权。
+ */
+const PANEL_GRANT_LATERAL = `-- P1 T1.10：双表判定——旧 jz_app_grants UNION ALL 新 jz_resource_grants(resource_type='panel')
+         -- sub_id 语义：'' = 整面板授权；非空 = 该面板某 permission 条目授权
+         LEFT JOIN LATERAL (
+           SELECT g2.level FROM (
+             SELECT g.level FROM jz_app_grants g
+             WHERE g.app_id = p.source_app_id
+               AND g.level != 'none'
+               AND (p.permission IS NULL OR g.permission_id = p.permission)
+               AND (
+                 (g.target_type = 'user' AND g.target_id = $1)
+                 OR (g.target_type = 'role' AND g.target_id IN (SELECT u.role_id FROM jz_users u WHERE u.id = $1))
+                 OR (g.target_type = 'department' AND g.target_id IN (
+                   SELECT dm.department_id FROM jz_department_members dm WHERE dm.user_id = $1
+                 ))
+               )
+             UNION ALL
+             SELECT rg.level FROM jz_resource_grants rg
+             WHERE rg.resource_type = 'panel'
+               AND rg.resource_id = p.id
+               AND rg.level != 'none'
+               AND (rg.sub_id = '' OR p.permission IS NULL OR rg.sub_id = p.permission)
+               AND (
+                 (rg.target_type = 'user' AND rg.target_id = $1)
+                 OR (rg.target_type = 'role' AND rg.target_id IN (SELECT u.role_id FROM jz_users u WHERE u.id = $1))
+                 OR (rg.target_type = 'department' AND rg.target_id IN (
+                   SELECT dm.department_id FROM jz_department_members dm WHERE dm.user_id = $1
+                 ))
+               )
+           ) g2
+           LIMIT 1
+         ) g ON TRUE`;
+
+/** JSONB 多语言字段：对象原样返回；旧数据为字符串时按中文；JSON 文本先解析 */
+function asI18n(value: unknown): Record<string, string> | null {
+  if (value == null || value === '') return null;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object') return parsed as Record<string, string>;
+    } catch { /* 普通字符串 */ }
+    return { zh: value };
+  }
+  return typeof value === 'object' ? (value as Record<string, string>) : null;
+}
+
+/** 「应用」入口里的一个功能（面板），MC12 */
+export interface AppEntryPanelItem {
+  id: string;
+  name: Record<string, string>;
+  icon: string;
+  entryComponent: string;
+  sortOrder: number;
+  mobile?: { supported: boolean; entryComponent?: string; layout?: 'full' | 'sheet' };
+}
+
+/** 「应用」入口里的一个应用卡片（GET /api/app-entries），MC12 */
+export interface AppEntryItem {
+  appId: string;
+  name: Record<string, string> | null;
+  version: string;
+  description: Record<string, string> | null;
+  /** 只读期内为 readonly（应用自身或托管应用的宿主授权到期但仍在只读期）；到期且不在只读期的应用不返回 */
+  license: { state: 'valid' | 'readonly'; readonlyUntil: string | null };
+  /** 只读的来源：self 为应用自身授权，host 为宿主授权；valid 时不返回 */
+  readonlyCause?: 'self' | 'host';
+  /** 托管应用的宿主（manifest.tags 含 hosted-by:X） */
+  hostAppId?: string;
+  entryPanels: AppEntryPanelItem[];
+}
 
 export interface SidebarItem {
   id: string;
@@ -109,6 +185,7 @@ export class PanelService implements OnModuleInit {
                 p.message_schema as "messageSchema",
                 p.mobile_config as "mobile",
                 a.version as "appVersion",
+                a.manifest->'tags' as "appTags",
                 COALESCE(us.visible, TRUE) as "visible",
                 COALESCE(us.group_name, '') as "groupName",
                 COALESCE(us.sort_order, p.sort_order) as "sortOrder",
@@ -117,43 +194,15 @@ export class PanelService implements OnModuleInit {
                 g.level AS "grantRole"
          FROM jz_panels p
          LEFT JOIN jz_user_sidebar us ON us.panel_id = p.id AND us.user_id = $1
-         -- P1 T1.10：双表判定——旧 jz_app_grants UNION ALL 新 jz_resource_grants(resource_type='panel')
-         -- sub_id 语义：'' = 整面板授权；非空 = 该面板某 permission 条目授权
-         LEFT JOIN LATERAL (
-           SELECT g2.level FROM (
-             SELECT g.level FROM jz_app_grants g
-             WHERE g.app_id = p.source_app_id
-               AND g.level != 'none'
-               AND (p.permission IS NULL OR g.permission_id = p.permission)
-               AND (
-                 (g.target_type = 'user' AND g.target_id = $1)
-                 OR (g.target_type = 'role' AND g.target_id IN (SELECT u.role_id FROM jz_users u WHERE u.id = $1))
-                 OR (g.target_type = 'department' AND g.target_id IN (
-                   SELECT dm.department_id FROM jz_department_members dm WHERE dm.user_id = $1
-                 ))
-               )
-             UNION ALL
-             SELECT rg.level FROM jz_resource_grants rg
-             WHERE rg.resource_type = 'panel'
-               AND rg.resource_id = p.id
-               AND rg.level != 'none'
-               AND (rg.sub_id = '' OR p.permission IS NULL OR rg.sub_id = p.permission)
-               AND (
-                 (rg.target_type = 'user' AND rg.target_id = $1)
-                 OR (rg.target_type = 'role' AND rg.target_id IN (SELECT u.role_id FROM jz_users u WHERE u.id = $1))
-                 OR (rg.target_type = 'department' AND rg.target_id IN (
-                   SELECT dm.department_id FROM jz_department_members dm WHERE dm.user_id = $1
-                 ))
-               )
-           ) g2
-           LIMIT 1
-         ) g ON TRUE
+         ${PANEL_GRANT_LATERAL}
          LEFT JOIN jz_installed_apps a ON a.app_id = p.source_app_id
-         WHERE (p.source_app_id IS NULL OR a.status = 'active')
+         -- MC11/MC12：授权到期但仍在只读期的应用照常可打开（只读由应用自己执行），否则「应用」入口会点开空白
+         WHERE (p.source_app_id IS NULL OR a.status = 'active'
+                OR (a.status = 'license_expired' AND a.license_readonly_until > now()))
          ORDER BY COALESCE(us.sort_order, p.sort_order)`,
         [userId],
       );
-      rows = r;
+      rows = await this.dropPanelsOfUnusableHosts(r);
     } else {
       const { rows: r } = await this.db.query(
         `SELECT p.id, p.name, p.icon, p.permission,
@@ -172,37 +221,7 @@ export class PanelService implements OnModuleInit {
                 g.level AS "grantRole"
          FROM jz_panels p
          LEFT JOIN jz_user_sidebar us ON us.panel_id = p.id AND us.user_id = $1
-         -- P1 T1.10：双表判定——旧 jz_app_grants UNION ALL 新 jz_resource_grants(resource_type='panel')
-         -- sub_id 语义：'' = 整面板授权；非空 = 该面板某 permission 条目授权
-         LEFT JOIN LATERAL (
-           SELECT g2.level FROM (
-             SELECT g.level FROM jz_app_grants g
-             WHERE g.app_id = p.source_app_id
-               AND g.level != 'none'
-               AND (p.permission IS NULL OR g.permission_id = p.permission)
-               AND (
-                 (g.target_type = 'user' AND g.target_id = $1)
-                 OR (g.target_type = 'role' AND g.target_id IN (SELECT u.role_id FROM jz_users u WHERE u.id = $1))
-                 OR (g.target_type = 'department' AND g.target_id IN (
-                   SELECT dm.department_id FROM jz_department_members dm WHERE dm.user_id = $1
-                 ))
-               )
-             UNION ALL
-             SELECT rg.level FROM jz_resource_grants rg
-             WHERE rg.resource_type = 'panel'
-               AND rg.resource_id = p.id
-               AND rg.level != 'none'
-               AND (rg.sub_id = '' OR p.permission IS NULL OR rg.sub_id = p.permission)
-               AND (
-                 (rg.target_type = 'user' AND rg.target_id = $1)
-                 OR (rg.target_type = 'role' AND rg.target_id IN (SELECT u.role_id FROM jz_users u WHERE u.id = $1))
-                 OR (rg.target_type = 'department' AND rg.target_id IN (
-                   SELECT dm.department_id FROM jz_department_members dm WHERE dm.user_id = $1
-                 ))
-               )
-           ) g2
-           LIMIT 1
-         ) g ON TRUE
+         ${PANEL_GRANT_LATERAL}
          ORDER BY COALESCE(us.sort_order, p.sort_order)`,
         [userId],
       );
@@ -267,6 +286,102 @@ export class PanelService implements OnModuleInit {
       }));
   }
 
+  /**
+   * 「应用」入口（MC12，T-P-19）：PC「应用」浮层与移动「应用」标签的数据源。
+   * - 可见性与侧栏相同（PANEL_GRANT_LATERAL；管理员不看授权），只取有入口组件的第三方面板，避免点开空白；
+   * - 应用授权有效或在只读期内才返回，只读期内带只读标记；
+   * - 托管应用（tags 含 hosted-by:X）随宿主：宿主未安装、不在 active 或只读期内时不返回；宿主只读时带只读标记；
+   * - 应用按安装时间排列；面板按 manifest sortOrder 升序，相同时按 manifest 中的先后；
+   * - 不返回配对智能体：入口只用于显示与打开，打开后切换智能体仍按侧栏数据（侧栏已按智能体可见性处理），
+   *   因此不调用侧栏的配对智能体可见性查询。
+   */
+  async getUserAppEntries(userId: string, permissions: string[], now = Date.now()): Promise<AppEntryItem[]> {
+    if (!(await this.appTableExists())) return [];
+    const isAdmin = permissions.includes('sys:admin');
+
+    const { rows: appRows } = await this.db.query(
+      `SELECT a.app_id AS "appId", a.name, a.version, a.status,
+              a.license_readonly_until AS "licenseReadonlyUntil",
+              a.manifest->'tags' AS tags,
+              a.manifest->'description' AS description,
+              a.manifest->'panels' AS "manifestPanels"
+       FROM jz_installed_apps a
+       WHERE a.status IN ('active', 'license_expired')
+       ORDER BY a.installed_at`,
+    );
+    const states = new Map<string, AppLicenseSnapshot>();
+    for (const a of appRows) states.set(a.appId, licenseStateOf(a, now));
+
+    const cards: AppEntryItem[] = [];
+    const panelOrder = new Map<string, number>();
+    for (const a of appRows) {
+      const own = states.get(a.appId)!;
+      if (own.state === 'expired') continue;
+      const hostAppId = hostAppIdOf(a.tags);
+      const host = hostAppId ? states.get(hostAppId) : undefined;
+      // 宿主未安装、处于升级或失败等状态（不在 states 中），或到期且不在只读期：托管应用不显示
+      if (hostAppId && (!host || host.state === 'expired')) continue;
+
+      const ownUntil = own.state === 'readonly' ? own.readonlyUntil : null;
+      const hostUntil = host?.state === 'readonly' ? host.readonlyUntil : null;
+      const until = [ownUntil, hostUntil]
+        .filter((u): u is string => !!u)
+        .sort((x, y) => new Date(x).getTime() - new Date(y).getTime())[0] ?? null;
+      const card: AppEntryItem = {
+        appId: a.appId,
+        name: asI18n(a.name),
+        version: a.version,
+        description: asI18n(a.description),
+        license: until ? { state: 'readonly', readonlyUntil: until } : { state: 'valid', readonlyUntil: null },
+        ...(until ? { readonlyCause: ownUntil ? 'self' as const : 'host' as const } : {}),
+        ...(hostAppId ? { hostAppId } : {}),
+        entryPanels: [],
+      };
+      cards.push(card);
+      const manifestPanels: any[] = Array.isArray(a.manifestPanels) ? a.manifestPanels : [];
+      manifestPanels.forEach((mp, i) => { if (mp?.id) panelOrder.set(`${a.appId}\u0000${mp.id}`, i); });
+    }
+    if (cards.length === 0) return [];
+
+    const { rows: panelRows } = await this.db.query(
+      `SELECT p.id, p.name, p.icon, p.permission,
+              p.sort_order AS "sortOrder",
+              p.source_app_id AS "sourceAppId",
+              p.name_i18n AS "nameI18n",
+              p.entry_component AS "entryComponent",
+              p.mobile_config AS "mobile",
+              g.level AS "grantRole"
+       FROM jz_panels p
+       ${PANEL_GRANT_LATERAL}
+       WHERE p.category = 'third_party' AND p.source_app_id = ANY($2::text[])`,
+      [userId, cards.map(c => c.appId)],
+    );
+
+    const byApp = new Map(cards.map(c => [c.appId, c]));
+    for (const p of panelRows) {
+      const card = byApp.get(p.sourceAppId);
+      if (!card || !p.entryComponent) continue;
+      if (!isAdmin && !p.grantRole) continue;
+      const mobile = p.mobile ? (typeof p.mobile === 'string' ? JSON.parse(p.mobile) : p.mobile) : undefined;
+      card.entryPanels.push({
+        id: p.id,
+        name: asI18n(p.nameI18n) ?? { zh: p.name },
+        icon: p.icon ?? '',
+        entryComponent: p.entryComponent,
+        sortOrder: Number(p.sortOrder ?? 100),
+        ...(mobile ? { mobile } : {}),
+      });
+    }
+    const indexOf = (appId: string, panelId: string) => panelOrder.get(`${appId}\u0000${panelId}`) ?? Number.MAX_SAFE_INTEGER;
+    for (const card of cards) {
+      card.entryPanels.sort((x, y) =>
+        x.sortOrder - y.sortOrder
+        || indexOf(card.appId, x.id) - indexOf(card.appId, y.id)
+        || x.id.localeCompare(y.id));
+    }
+    return cards.filter(c => c.entryPanels.length > 0);
+  }
+
   async listPanelsByCategory(category: string) {
     const { rows } = await this.db.query(
       `SELECT id, name, icon, permission, is_builtin as "isBuiltin", sort_order as "sortOrder",
@@ -322,6 +437,25 @@ export class PanelService implements OnModuleInit {
       );
     }
     await this.db.query(`DELETE FROM jz_panels WHERE source_app_id = $1`, [appId]);
+  }
+
+  /**
+   * MC12（T-P-19）：托管应用（tags 含 hosted-by:X）的面板随宿主 X 显示——宿主未安装、未运行，
+   * 或授权到期且不在只读期时去掉，与「应用」入口一致（深链与智能体导航按侧栏数据打开面板）。
+   */
+  private async dropPanelsOfUnusableHosts(rows: any[], now = Date.now()): Promise<any[]> {
+    const hostIds = [...new Set(rows.map(r => hostAppIdOf(r.appTags)).filter((h): h is string => !!h))];
+    if (hostIds.length === 0) return rows;
+    const { rows: hosts } = await this.db.query(
+      `SELECT app_id AS "appId", status, license_readonly_until AS "licenseReadonlyUntil"
+       FROM jz_installed_apps WHERE app_id = ANY($1::text[])`,
+      [hostIds],
+    );
+    const usable = new Set(hosts.filter((h: any) => isAppUsable(h, now)).map((h: any) => h.appId));
+    return rows.filter(r => {
+      const host = hostAppIdOf(r.appTags);
+      return !host || usable.has(host);
+    });
   }
 
   /** 检查 jz_installed_apps 表是否已存在（L1 阶段该表不存在） */

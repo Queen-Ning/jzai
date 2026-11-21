@@ -1,6 +1,18 @@
 'use client';
 
 import React, { Suspense, useMemo, Component, ErrorInfo, ReactNode } from 'react';
+import * as ReactDOM from 'react-dom';
+import { toast } from 'sonner';
+import { isValidDeepLinkRoute } from '@/lib/deep-link';
+
+/** 面板经 sdk.nav.open 请求打开另一个面板（MC06）；page.tsx 监听，移动端映射到 jianzhi:mobile-open-panel */
+export const OPEN_PANEL_EVENT = 'jianzhi:open-panel';
+export interface OpenPanelDetail {
+  panelId: string;
+  route?: string | null;
+  /** 发起的面板 id */
+  from?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -17,11 +29,20 @@ export class PanelLoadError extends Error {
 // SDK runtime (minimal — full version in app-sdk-runtime.ts)
 // ---------------------------------------------------------------------------
 
+/**
+ * 宿主 SDK 版本：2 起共享 react-dom（MC05，面板 SDK 的 react-dom-shim 据此检查宿主是否过旧）。
+ */
+const HOST_SDK_VERSION = 2;
+
 function ensureSdkGlobal() {
   if (typeof window === 'undefined') return;
-  if ((window as any).__JZ_SDK__) return;
+  const current = (window as any).__JZ_SDK__;
+  if (current && Number(current.sdkVersion) >= HOST_SDK_VERSION) return;
   (window as any).__JZ_SDK__ = {
+    ...(current ?? {}),
     react: React,
+    reactDom: ReactDOM,
+    sdkVersion: HOST_SDK_VERSION,
   };
 }
 
@@ -113,6 +134,8 @@ interface ExtPanelProps {
   initialData?: unknown;
   onMessage?: (msg: unknown) => void;
   sdk?: unknown;
+  /** 面板内路由（深链 ?r= 或 sdk.nav.open 传入，MC06）；没有时为 null */
+  route?: string | null;
 }
 
 /** 面板 → Agent 结构化消息（与 main/src/assets/sdk/types/panel.d.ts 的 AgentMessage 对齐） */
@@ -137,11 +160,15 @@ interface DynamicPanelLoaderProps {
   onMessage?: (msg: unknown) => void;
   /** 面板经 sdk.agent.send() 发出的结构化消息，由宿主路由到绑定 Agent 的会话 */
   onAgentMessage?: (msg: PanelAgentMessage) => void | Promise<void>;
+  /** 面板内路由（MC06），作为 route 属性传给面板 */
+  route?: string | null;
+  /** 面板经 sdk.nav.setRoute() 更新自身路由；宿主据此写地址栏（replaceState） */
+  onRouteChange?: (route: string) => void;
 }
 
 const MAIN_URL = process.env.NEXT_PUBLIC_API_URL ?? '';
 
-export function DynamicPanelLoader({ panel, initialData, onMessage, onAgentMessage }: DynamicPanelLoaderProps) {
+export function DynamicPanelLoader({ panel, initialData, onMessage, onAgentMessage, route, onRouteChange }: DynamicPanelLoaderProps) {
   if (panel.status === 'uninstalled') {
     return <UninstalledTombstone panelName={panel.name} />;
   }
@@ -164,7 +191,7 @@ export function DynamicPanelLoader({ panel, initialData, onMessage, onAgentMessa
     [url],
   );
 
-  // 每面板独立的 sdk 对象：共享 react 实例 + 受宿主路由约束的 agent 通道
+  // 每面板独立的 sdk 对象：共享 react 实例 + 受宿主路由约束的 agent 通道 + 宿主导航与提示（MC06）
   const sdk = useMemo(() => ({
     ...((typeof window !== 'undefined' ? (window as any).__JZ_SDK__ : undefined) ?? { react: React }),
     agent: {
@@ -173,13 +200,40 @@ export function DynamicPanelLoader({ panel, initialData, onMessage, onAgentMessa
         await onAgentMessage?.({ text: msg.text, context: msg.context });
       },
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [onAgentMessage]);
+    nav: {
+      /** 打开另一个面板（可带面板内路由）；面板不存在或无权访问时宿主提示 */
+      open: (panelId: string, nextRoute?: string) => {
+        if (typeof panelId !== 'string' || !panelId) return;
+        if (nextRoute !== undefined && !isValidDeepLinkRoute(nextRoute)) {
+          console.warn(`[DynamicPanelLoader] ${panel.id}: sdk.nav.open 的路由须为不超过 512 个字符的字符串`);
+          return;
+        }
+        const detail: OpenPanelDetail = { panelId, route: nextRoute ?? null, from: panel.id };
+        window.dispatchEvent(new CustomEvent(OPEN_PANEL_EVENT, { detail }));
+      },
+      /** 更新本面板的路由，宿主写入地址栏（不新增历史记录） */
+      setRoute: (nextRoute: string) => {
+        if (!isValidDeepLinkRoute(nextRoute)) {
+          console.warn(`[DynamicPanelLoader] ${panel.id}: sdk.nav.setRoute 的路由须为不超过 512 个字符的字符串`);
+          return;
+        }
+        onRouteChange?.(nextRoute);
+      },
+    },
+    /** 宿主提示（右上角）：type 为 success、error，其他为普通提示 */
+    toast: (message: string, opts?: { type?: 'info' | 'success' | 'error' }) => {
+      const text = String(message ?? '').slice(0, 300);
+      if (!text) return;
+      if (opts?.type === 'success') toast.success(text);
+      else if (opts?.type === 'error') toast.error(text);
+      else toast.message(text);
+    },
+  }), [onAgentMessage, onRouteChange, panel.id]);
 
   return (
     <PanelErrorBoundary panelName={panel.name}>
       <Suspense fallback={<PanelSkeleton />}>
-        <Comp initialData={initialData} onMessage={onMessage} sdk={sdk} />
+        <Comp initialData={initialData} onMessage={onMessage} sdk={sdk} route={route ?? null} />
       </Suspense>
     </PanelErrorBoundary>
   );

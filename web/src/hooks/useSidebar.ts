@@ -34,8 +34,11 @@ export function useSidebar(token?: string | null) {
   const [panels, setPanels] = useState<SidebarPanel[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // 已完成拉取的令牌：首页深链（MC06）须等当前令牌的面板列表到达后再解析，避免误判「面板不存在」
+  const [loadedToken, setLoadedToken] = useState<string | null>(null);
+
   const load = useCallback(async () => {
-    if (!token) { setPanels([]); setLoading(false); return; }
+    if (!token) { setPanels([]); setLoading(false); setLoadedToken(null); return; }
     try {
       const resp = await fetch(`${MAIN_URL}/api/sidebar`, {
         headers: { 'Authorization': `Bearer ${token}` },
@@ -44,6 +47,7 @@ export function useSidebar(token?: string | null) {
       if (Array.isArray(data)) setPanels(data);
     } catch {}
     setLoading(false);
+    setLoadedToken(token);
   }, [token]);
 
   useEffect(() => { load(); }, [load]);
@@ -85,5 +89,5 @@ export function useSidebar(token?: string | null) {
     await load();
   }, [token, load]);
 
-  return { panels, loading, save, reset, reload: load };
+  return { panels, loading, loaded: !!token && loadedToken === token, save, reset, reload: load };
 }

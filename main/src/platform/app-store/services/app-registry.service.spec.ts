@@ -6,7 +6,7 @@ describe('AppRegistryService', () => {
       query: jest.fn().mockResolvedValue({
         rows: [
           {
-            app_id: 'com.menhu.drawing.dimtuner',
+            app_id: 'com.example.drawing.dimtuner',
             short_name: 'dimension-tuner',
             ns_prefix: 'dt',
             schema_name: 'app_dim_tuner',
@@ -30,15 +30,15 @@ describe('AppRegistryService', () => {
 
   it('maps the persisted installed path to installDir', async () => {
     const db = {
-      query: jest.fn().mockResolvedValue({ rows: [{ appId: 'com.menhu.drawing.dimtuner', installDir: '/workspace/app-store/dimension-tuner' }] }),
+      query: jest.fn().mockResolvedValue({ rows: [{ appId: 'com.example.drawing.dimtuner', installDir: '/workspace/app-store/dimension-tuner' }] }),
     };
     const service = new AppRegistryService(db as any);
 
-    const app = await service.findOne('com.menhu.drawing.dimtuner');
+    const app = await service.findOne('com.example.drawing.dimtuner');
 
     expect(db.query).toHaveBeenCalledWith(
       expect.stringContaining('extract_dir as "installDir"'),
-      ['com.menhu.drawing.dimtuner'],
+      ['com.example.drawing.dimtuner'],
     );
     expect(app?.installDir).toBe('/workspace/app-store/dimension-tuner');
   });
@@ -47,7 +47,7 @@ describe('AppRegistryService', () => {
     const db = { query: jest.fn().mockResolvedValue({ rows: [] }) };
     const service = new AppRegistryService(db as any);
     const manifest = {
-      appId: 'com.menhu.drawing.dimtuner',
+      appId: 'com.example.drawing.dimtuner',
       shortName: 'dimension-tuner',
       nsPrefix: 'dt',
       version: '1.1.0',
@@ -58,7 +58,7 @@ describe('AppRegistryService', () => {
 
     expect(db.query).toHaveBeenCalledWith(
       expect.stringContaining("WHERE app_id=$1 AND status='uninstalled'"),
-      expect.arrayContaining(['com.menhu.drawing.dimtuner', 'dimension-tuner', 'dt', '1.1.0']),
+      expect.arrayContaining(['com.example.drawing.dimtuner', 'dimension-tuner', 'dt', '1.1.0']),
     );
   });
 });

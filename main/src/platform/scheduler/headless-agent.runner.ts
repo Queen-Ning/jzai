@@ -34,12 +34,15 @@ export class HeadlessAgentRunner implements OnModuleInit {
     const principal = createSystemPrincipal('scheduler',
       task.onConfirm === 'skip_tool' ? ['confirm:skip_tool'] : []);
 
-    // reject 模式：无人值守自动应答（立即拒绝，避免挂到超时）
+    // reject 模式：无人值守自动应答（立即拒绝，避免挂到超时）。
+    // MC04：只处理本次运行会话发出的请求，并以请求所属用户（runAsUser）作为回复者通过归属校验；
+    // 不碰同一时段其他用户交互会话的确认
     let autoReject: ((req: ConfirmRequest) => void) | null = null;
     if (task.onConfirm === 'reject' && this.confirmBridge) {
       autoReject = (req: ConfirmRequest) => {
+        if (req.sessionId !== sessionId) return;
         this.logger.log(`无人值守自动拒绝确认请求 ${req.confirmId}（${req.toolName}），任务 ${task.id}`);
-        this.confirmBridge!.handleReply(req.confirmId, false);
+        this.confirmBridge!.handleReply(req.confirmId, false, undefined, req.userId);
       };
       this.confirmBridge.events.on('confirm_request', autoReject);
     }

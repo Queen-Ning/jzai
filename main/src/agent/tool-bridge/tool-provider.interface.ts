@@ -34,6 +34,8 @@ export interface ToolContext {
   principal?: InvocationPrincipal;
   userId?: string;
   agentKey?: string;
+  /** 所在会话（agent sessionId）；人工确认请求带上它，网关与无头运行据此路由（MC04） */
+  sessionId?: string;
   userEmail?: string;
   /** 运行中的 agent 归属的 APP（T2/P3 由 AgentRegistry 归属表注入；内置 agent 为空） */
   appId?: string;

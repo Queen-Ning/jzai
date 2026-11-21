@@ -3,6 +3,7 @@ import { ModuleRef } from '@nestjs/core';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as yaml from 'js-yaml';
 import { DbService } from '../../../db/db.service';
 import { AppConfigService } from '../../../config/app-config.service';
 import { AppRegistryService } from './app-registry.service';
@@ -11,9 +12,10 @@ import { CredentialService } from '../../../capability/skill/credential.service'
 import { ToolBridgeService } from '../../../agent/tool-bridge/tool-bridge.service';
 import { DevUploadService } from './dev-upload.service';
 import { createDevMcpPrincipal } from '../runtime/invocation-principal';
-import { createInvocationPrincipal } from '../runtime/invocation-principal';
-import { AppMcpExposeService } from './app-mcp-expose.service';
+import { loadActiveUser, userPrincipalOf } from './active-user';
+import { AppMcpExposeService, isFirstPartyApp } from './app-mcp-expose.service';
 import { ResourceAccessService } from '../../authz/resource-access.service';
+import { isAppUsable } from '../app-state';
 
 export type DevTokenScope = 'read' | 'invoke' | 'manage';
 
@@ -29,6 +31,45 @@ interface StoredDevToken {
 export interface VerifiedDevToken {
   tokenId: string;
   scopes: DevTokenScope[];
+  /** 签发人用户 id（MC01：调用以该用户的身份与权限判定） */
+  issuedBy: string;
+}
+
+// ── MC14：开发 MCP 提示（prompts/*.md） ──
+const PROMPT_NAME = /^[a-z][a-z0-9_]{2,63}$/;
+const PROMPT_ARGUMENT_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const PROMPT_MAX_ARGUMENTS = 5;
+const PROMPT_MAX_INCLUDES = 3;
+export const PROMPT_ARGUMENT_MAX_CHARS = 2000;
+export const PROMPT_INCLUDE_MAX_BYTES = 100 * 1024;
+
+export interface PromptArgument {
+  name: string;
+  description: string;
+  required: boolean;
+}
+
+interface LoadedPrompt {
+  name: string;
+  description: string;
+  arguments: PromptArgument[];
+  /** 相对应用安装目录的 docs/ 下路径 */
+  include: string[];
+  body: string;
+  appId: string;
+  root: string;
+}
+
+/**
+ * 提示正文的文本替换（不做其他求值）：先处理 {{#参数}}…{{/参数}}（参数非空时保留内容，否则删除），
+ * 再把 {{参数}} 换成参数值。只认 frontmatter 中声明的参数；参数值不会再被展开。
+ */
+export function renderPromptTemplate(body: string, values: ReadonlyMap<string, string>): string {
+  const sections = body.replace(/\{\{#([A-Za-z][A-Za-z0-9_]*)\}\}([\s\S]*?)\{\{\/\1\}\}/g, (whole, name: string, inner: string) => {
+    if (!values.has(name)) return whole;
+    return values.get(name)!.trim() ? inner : '';
+  });
+  return sections.replace(/\{\{([A-Za-z][A-Za-z0-9_]*)\}\}/g, (whole, name: string) => (values.has(name) ? values.get(name)! : whole));
 }
 
 const DEV_TOKEN_SCOPE = 'dev-mcp';
@@ -140,7 +181,7 @@ export class DevMcpService {
     await this.audit.log('dev-mcp', 'dev_token_revoke', actorId, tokenId ? { tokenId } : { all: true });
   }
 
-  /** 校验 token，成功返回稳定 tokenId 与 scope；失败/过期返回 null。 */
+  /** 校验 token，成功返回稳定 tokenId、scope 与签发人；失败/过期返回 null。 */
   async verifyToken(token: string | undefined): Promise<VerifiedDevToken | null> {
     if (!token) return null;
     const hash = Buffer.from(this.hashToken(token));
@@ -148,7 +189,7 @@ export class DevMcpService {
       const b = Buffer.from(stored.tokenHash);
       if (hash.length === b.length && crypto.timingSafeEqual(hash, b)) {
         if (stored.expiresAt && Date.parse(stored.expiresAt) <= Date.now()) return null;
-        return { tokenId: stored.tokenId, scopes: stored.scopes };
+        return { tokenId: stored.tokenId, scopes: stored.scopes, issuedBy: stored.issuedBy };
       }
     }
     return null;
@@ -180,7 +221,9 @@ export class DevMcpService {
   private async getExposedToolIds(): Promise<Set<string>> {
     const apps = await this.registry.findAll();
     const ids = new Set<string>();
-    for (const app of apps.filter(a => a.status === 'active')) {
+    // MC11：只读期内的应用照常暴露工具（写入由应用自行拒绝），只读期满后才隐藏
+    const now = Date.now();
+    for (const app of apps.filter(a => isAppUsable(a, now))) {
       // P3：三方包 mcpExposed 须审批后生效（首方恒通）
       if (this.expose && !(await this.expose.isAllowed(app.appId))) continue;
       for (const tp of app.manifest?.backend?.toolProviders ?? []) {
@@ -203,45 +246,45 @@ export class DevMcpService {
     return [...BUILTIN_TOOLS, ...exposedTools];
   }
 
-  async callTool(name: string, args: unknown, actorId: string): Promise<unknown> {
+  /**
+   * 调用工具。actorId 是审计用的稳定主体（dev-mcp:<tokenId>）；issuedBy 是令牌签发人的用户 id（MC01）。
+   * 内置上传工具不做授权检查；暴露工具以签发人的用户身份判定，并把该身份带给工具。
+   */
+  async callTool(name: string, args: unknown, actorId: string, issuedBy?: string): Promise<unknown> {
     const builtin = BUILTIN_TOOLS.find(t => t.name === name);
     if (builtin) {
       const result = this.callBuiltinTool(name, args ?? {});
-      await this.audit.log('dev-mcp', 'dev_mcp_call', actorId, { tool: name });
+      await this.audit.log('dev-mcp', 'dev_mcp_call', actorId, { tool: name, issuedBy });
       return result;
     }
     const exposed = await this.getExposedToolIds();
     if (!exposed.has(name)) throw new Error(`Tool not exposed via dev MCP: ${name}`);
-    // P3 双保险：grants 控"谁能调"（审批控"是否暴露"）。dev-mcp principal 属 system 直通，
-    // 故以 actor 的真实用户身份判定 canView。
-    if (this.access) {
-      const principal = await this.principalForActor(actorId);
-      if (!principal || !(await this.access.canView('tool', name, principal))) {
-        throw new Error(`No tool grant for actor: ${name}`);
-      }
+    // 签发人不存在或已停用：令牌失效
+    const user = issuedBy ? await this.principalForUser(issuedBy) : null;
+    if (!user) throw new Error('Dev token issuer not found');
+    // P3 双保险：grants 控"谁能调"（审批控"是否暴露"）。dev-mcp 主体在 canView 中属 system 直通，
+    // 故以签发人的 user 主体判定。
+    if (this.access && !(await this.access.canView('tool', name, user))) {
+      throw new Error(`No tool grant for actor: ${name}`);
     }
     const bridge = this.moduleRef.get(ToolBridgeService, { strict: false });
-    const result = await bridge.callTool(name, args, createDevMcpPrincipal(actorId));
-    await this.audit.log('dev-mcp', 'dev_mcp_call', actorId, { tool: name });
+    const result = await bridge.callTool(name, args, createDevMcpPrincipal(actorId, {
+      userId: user.userId!,
+      roleIds: user.roleIds,
+      departmentIds: user.departmentIds,
+      permissions: user.permissions,
+    }));
+    await this.audit.log('dev-mcp', 'dev_mcp_call', actorId, { tool: name, issuedBy });
     return result;
   }
 
-  /** P3：以 actor 的真实用户身份（role/department/permissions）构造 canView 判定主体 */
-  private async principalForActor(actorId: string) {
-    const { rows } = await this.db.query(
-      `SELECT u.id, u.role_id, r.permissions
-       FROM jz_users u LEFT JOIN jz_roles r ON r.id = u.role_id WHERE u.id = $1`, [actorId]);
-    if (!rows[0]) return null;
-    const dm = await this.db.query(
-      `SELECT department_id FROM jz_department_members WHERE user_id=$1`, [actorId]);
-    return createInvocationPrincipal({
-      type: 'user', principalId: `user:${actorId}`, userId: actorId,
-      roleIds: rows[0].role_id ? [rows[0].role_id] : [],
-      departmentIds: dm.rows.map(r => r.department_id),
-      permissions: rows[0].permissions ?? [],
-      origin: 'dev-mcp',
-      issuedAt: Date.now(),
-    });
+  /**
+   * 以用户的真实身份（role/department/permissions）构造 canView 判定主体。
+   * 入参必须是用户 id；用户不存在或 status = 'disabled' 时返回 null。
+   */
+  private async principalForUser(userId: string) {
+    const user = await loadActiveUser(this.db, userId);
+    return user ? userPrincipalOf(user, 'dev-mcp') : null;
   }
 
   private callBuiltinTool(name: string, args: any): unknown {
@@ -264,12 +307,166 @@ export class DevMcpService {
 
   // ── resources（首方包 docs/ 与 templates/）──
 
-  private async resourceRoots(): Promise<string[]> {
+  /** 提供资源与提示的应用：可用（已激活，或授权只读期内，MC11）、首方应用号且声明 appstore:manage，按安装顺序 */
+  private async sourceApps(): Promise<Array<{ appId: string; root: string }>> {
     const apps = await this.registry.findAll();
+    const now = Date.now();
+    // MC10：首方判定同时看应用号（io.jzai.*）与 appstore:manage，旧号首方包不再提供资源
     return apps
-      .filter(a => a.status === 'active' && a.installDir
-        && (a.manifest?.platformCapabilities ?? []).includes('appstore:manage'))
-      .map(a => a.installDir!);
+      .filter(a => isAppUsable(a, now) && a.installDir && isFirstPartyApp(a.manifest))
+      .map(a => ({ appId: a.appId, root: a.installDir! }));
+  }
+
+  private async resourceRoots(): Promise<string[]> {
+    return (await this.sourceApps()).map(a => a.root);
+  }
+
+  // ── prompts（MC14：首方包 prompts/*.md，来源与资源相同）──
+
+  async listPrompts(): Promise<Array<{ name: string; description: string; arguments: PromptArgument[] }>> {
+    return (await this.promptFiles()).map(p => ({ name: p.name, description: p.description, arguments: p.arguments }));
+  }
+
+  /**
+   * 取得一个提示：校验参数，做 {{参数}} 与 {{#参数}}…{{/参数}} 文本替换，再在末尾依次附上 include 文件（调用时读取，不缓存）。
+   * 审计只记提示名称、来源应用与签发人，不记参数值。
+   */
+  async getPrompt(
+    name: unknown, args: unknown, actorId: string, issuedBy?: string,
+  ): Promise<{ description: string; messages: Array<{ role: 'user'; content: { type: 'text'; text: string } }> }> {
+    if (typeof name !== 'string' || !name) throw new Error('Prompt name is required');
+    const prompt = (await this.promptFiles()).find(p => p.name === name);
+    if (!prompt) throw new Error(`Prompt not found: ${name}`);
+
+    const given = args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+    const values = new Map<string, string>();
+    for (const arg of prompt.arguments) {
+      const raw = given[arg.name];
+      if (raw !== undefined && raw !== null && typeof raw !== 'string') {
+        throw new Error(`Argument ${arg.name} must be a string`);
+      }
+      const value = typeof raw === 'string' ? raw : '';
+      if (value.length > PROMPT_ARGUMENT_MAX_CHARS) {
+        throw new Error(`Argument ${arg.name} exceeds ${PROMPT_ARGUMENT_MAX_CHARS} characters`);
+      }
+      if (arg.required && !value.trim()) throw new Error(`Missing required argument: ${arg.name}`);
+      values.set(arg.name, value);
+    }
+
+    let text = renderPromptTemplate(prompt.body, values);
+    for (const include of prompt.include) {
+      const file = path.join(prompt.root, include);
+      text += `\n\n---\n（附：${include}）\n\n${fs.readFileSync(file, 'utf-8')}`;
+    }
+    await this.audit.log('dev-mcp', 'dev_mcp_prompt_get', actorId, { prompt: name, appId: prompt.appId, issuedBy });
+    return { description: prompt.description, messages: [{ role: 'user', content: { type: 'text', text } }] };
+  }
+
+  /** 每次调用时重新读取：已激活首方包的 prompts/*.md（不递归）；不合法的跳过并告警，同名先到先得 */
+  private async promptFiles(): Promise<LoadedPrompt[]> {
+    const out: LoadedPrompt[] = [];
+    const seen = new Map<string, string>();
+    for (const { appId, root } of await this.sourceApps()) {
+      const dir = path.join(root, 'prompts');
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+      const files = fs.readdirSync(dir, { withFileTypes: true })
+        .filter(e => e.isFile() && e.name.endsWith('.md') && !e.name.startsWith('.'))
+        .map(e => e.name)
+        .sort();
+      for (const fileName of files) {
+        const where = `${appId}/prompts/${fileName}`;
+        const parsed = this.parsePromptFile(root, path.join(dir, fileName), where);
+        if (!parsed) continue;
+        const first = seen.get(parsed.name);
+        if (first) {
+          this.warnOnce(`prompt ${parsed.name} in ${where} ignored: same name already provided by ${first}`);
+          continue;
+        }
+        seen.set(parsed.name, where);
+        out.push({ ...parsed, appId, root });
+      }
+    }
+    return out;
+  }
+
+  private parsePromptFile(root: string, file: string, where: string): Omit<LoadedPrompt, 'appId' | 'root'> | null {
+    const skip = (reason: string) => { this.warnOnce(`prompt ${where} skipped: ${reason}`); return null; };
+    const match = fs.readFileSync(file, 'utf-8').match(/^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)([\s\S]*)$/);
+    if (!match) return skip('missing frontmatter');
+    let meta: any;
+    try {
+      meta = yaml.load(match[1]);
+    } catch (err: any) {
+      return skip(`invalid frontmatter: ${err?.message ?? err}`);
+    }
+    if (!meta || typeof meta !== 'object') return skip('invalid frontmatter');
+    if (typeof meta.name !== 'string' || !PROMPT_NAME.test(meta.name)) {
+      return skip(`name must match ${PROMPT_NAME.source}`);
+    }
+    if (typeof meta.description !== 'string' || !meta.description.trim()) return skip('description is required');
+
+    const rawArgs = meta.arguments ?? [];
+    if (!Array.isArray(rawArgs) || rawArgs.length > PROMPT_MAX_ARGUMENTS) {
+      return skip(`arguments must be a list of at most ${PROMPT_MAX_ARGUMENTS} items`);
+    }
+    const args: PromptArgument[] = [];
+    for (const a of rawArgs) {
+      if (!a || typeof a !== 'object' || typeof a.name !== 'string' || !PROMPT_ARGUMENT_NAME.test(a.name)) {
+        return skip(`argument name must match ${PROMPT_ARGUMENT_NAME.source}`);
+      }
+      if (typeof a.description !== 'string' || !a.description.trim()) return skip(`argument ${a.name} needs a description`);
+      if (a.required !== undefined && typeof a.required !== 'boolean') return skip(`argument ${a.name}: required must be true or false`);
+      if (args.some(x => x.name === a.name)) return skip(`argument ${a.name} declared twice`);
+      args.push({ name: a.name, description: a.description, required: a.required === true });
+    }
+
+    const include = this.resolveIncludes(root, meta.include);
+    if (typeof include === 'string') return skip(include);
+    return { name: meta.name, description: meta.description, arguments: args, include, body: match[2] };
+  }
+
+  /**
+   * include（至多 3 个）：相对同一应用安装目录、位于 docs/ 下的 .md 文件，合计不超过 100KB。
+   * 返回规范化的相对路径列表，不合法时返回原因（该提示整体跳过）。
+   */
+  private resolveIncludes(root: string, include: unknown): string[] | string {
+    if (include === undefined || include === null) return [];
+    if (!Array.isArray(include) || include.length > PROMPT_MAX_INCLUDES) {
+      return `include must be a list of at most ${PROMPT_MAX_INCLUDES} paths`;
+    }
+    const docs = path.resolve(root, 'docs');
+    const out: string[] = [];
+    let total = 0;
+    for (const item of include) {
+      if (typeof item !== 'string' || !item) return 'include entries must be strings';
+      const parts = item.split(/[\\/]+/);
+      if (path.isAbsolute(item) || /^[a-zA-Z]:/.test(item) || parts.includes('..')) return `include ${item} must be a relative path without ..`;
+      if (parts[0] !== 'docs' || !item.endsWith('.md')) return `include ${item} must be a .md file under docs/`;
+      const target = path.resolve(root, item);
+      if (!target.startsWith(docs + path.sep)) return `include ${item} must be a .md file under docs/`;
+      let real: string;
+      try {
+        real = fs.realpathSync(target);
+      } catch {
+        return `include ${item} not found in this app`;
+      }
+      // 符号链接也不能指出本应用的 docs/
+      if (!real.startsWith(fs.realpathSync(docs) + path.sep) || !fs.statSync(real).isFile()) {
+        return `include ${item} must be a file inside this app's docs/`;
+      }
+      total += fs.statSync(real).size;
+      if (total > PROMPT_INCLUDE_MAX_BYTES) return `include files exceed ${PROMPT_INCLUDE_MAX_BYTES / 1024}KB in total`;
+      out.push(parts.join('/'));
+    }
+    return out;
+  }
+
+  /** 列表每次都会重新解析：同一条告警只记一次，避免刷屏 */
+  private readonly warned = new Set<string>();
+  private warnOnce(message: string): void {
+    if (this.warned.has(message)) return;
+    this.warned.add(message);
+    this.logger.warn(message);
   }
 
   async listResources(): Promise<Array<{ uri: string; name: string; mimeType: string }>> {

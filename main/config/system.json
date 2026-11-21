@@ -5,5 +5,16 @@
     "mcpEndpoint": "http://localhost:3011",
     "slug": "default",
     "workspacePath": "./workspace/knowledge_base"
+  },
+  "temporal": {
+    "enabled": false,
+    "address": "temporal:7233"
+  },
+  "sandbox": {
+    "enabled": false,
+    "maxInstances": 4,
+    "defaultMemoryMb": 64,
+    "defaultCpuMs": 2000,
+    "defaultTimeoutMs": 10000
   }
 }

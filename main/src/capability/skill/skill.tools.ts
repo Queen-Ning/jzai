@@ -8,6 +8,7 @@ import { SessionService } from '../../agent/session/session.service';
 import { ConfirmationBridgeService } from '../../agent/support/confirmation-bridge.service';
 import { ToolProvider, ToolContext, ToolInstance, ToolCatalogEntry } from '../../agent/tool-bridge/tool-provider.interface';
 import { structuredFromSkillResult, formatToolError } from '../../agent/tool-bridge/tool-error';
+import { randomUUID } from 'crypto';
 
 /**
  * SkillToolProvider — Agent Skills (HAR-based), skill testing, reloading, workshop, taskflow.
@@ -77,12 +78,15 @@ export class SkillToolProvider implements ToolProvider {
           if (skill.confirmForm?.length && !shouldSkipConfirm) {
             try {
               const editedArgs = await this.confirmBridge.requestConfirmation({
-                confirmId: `skill_${skill.name}_${Date.now()}`,
+                confirmId: `skill_${skill.name}_${Date.now()}_${randomUUID().slice(0, 8)}`,
                 toolName: `skill_${skill.name}`,
                 args,
                 parameters: skill.confirmForm.map(f => ({ name: f.key, type: f.type || 'string', required: f.required, description: f.label })),
                 confirmForm: skill.confirmForm,
                 description: skill.description,
+                // MC04：确认只归属当前用户与会话
+                userId: ctx.userId ?? ctx.principal?.userId,
+                sessionId: ctx.sessionId,
               });
               args = editedArgs;
             } catch (err: any) {

@@ -5,6 +5,7 @@ import SessionList from '@/components/SessionList';
 import { useI18n, LOCALES } from '@/i18n';
 import MobileTabBar from '@/components/mobile/MobileTabBar';
 import MobileAppsTab from '@/components/mobile/MobileAppsTab';
+import InboxBell from '@/components/inbox/InboxBell';
 import type { PanelAgentMessage } from '@/components/DynamicPanelLoader';
 
 interface AgentInfo {
@@ -154,6 +155,11 @@ export default function MobileShell({
               })}
             </div>
           )}
+        </div>
+
+        {/* 消息与待办（MC07） */}
+        <div className="shrink-0 mr-1">
+          <InboxBell token={token} mobile />
         </div>
 
         {/* 用户菜单 */}

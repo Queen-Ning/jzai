@@ -3,7 +3,13 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { execFileSync } from 'child_process';
-import { AppManifest, AppManifestSchema } from './manifest.schema';
+import {
+  AppManifest, AppManifestSchema, PERMISSION_COUNT_MAX, PERMISSION_COUNT_WARN, PERMISSION_GROUPS,
+} from './manifest.schema';
+import { RESERVED_NAMESPACE_LABEL, isFirstPartyAppId, isReservedAppId } from '../first-party';
+import { HANDLER_FORMAT } from '../runtime/handler-invocation';
+import { isFirstPartySignedTree } from '../services/package-signature.service';
+import { APP_ARCHIVE_LIMITS, FIRST_PARTY_SIGNED_ARCHIVE_LIMITS } from '../services/safe-archive.service';
 
 export type CheckLevel = 'critical' | 'warning';
 
@@ -36,6 +42,10 @@ const SHARED_TABLE_WHITELIST = new Set([
   'jz_kb_documents',
   'jz_kb_document_references',
 ]);
+
+/** database.poolMax 上限（MC03）：第三方包 5；首方包 20（与 manifest schema 的上限一致） */
+export const THIRD_PARTY_POOL_MAX = 5;
+export const FIRST_PARTY_POOL_MAX = 20;
 
 /** IDs of panels seeded by the platform (must not conflict) */
 const BUILTIN_PANEL_IDS = new Set([
@@ -119,11 +129,15 @@ export class AppValidatorService {
     const totalSize = allFiles.reduce((sum, file) => {
       try { return sum + fs.lstatSync(file).size; } catch { return sum; }
     }, 0);
-    if (totalSize > 200 * 1024 * 1024) {
-      check(1, 'critical', 'PKG_TOO_LARGE', `Package size ${(totalSize / 1024 / 1024).toFixed(1)}MB exceeds 200MB limit`);
+    // MC17：与解包同样两档上限。签名有效、清单与文件集合一致、appId 为首方的包用首方上限（逐文件哈希由调用方 verifyDirectory 检查）
+    const relFiles = allFiles.map(file => path.relative(extractDir, file).split(path.sep).join('/'));
+    const limits = isFirstPartySignedTree(extractDir, relFiles) ? FIRST_PARTY_SIGNED_ARCHIVE_LIMITS : APP_ARCHIVE_LIMITS;
+    const limitMb = limits.maxUncompressedBytes / 1024 / 1024;
+    if (totalSize > limits.maxUncompressedBytes) {
+      check(1, 'critical', 'PKG_TOO_LARGE', `Package size ${(totalSize / 1024 / 1024).toFixed(1)}MB exceeds ${limitMb}MB limit`);
     }
-    if (allFiles.length > 5000) {
-      check(1, 'critical', 'TOO_MANY_FILES', `Package contains ${allFiles.length} files, exceeds 5000 limit`);
+    if (allFiles.length > limits.maxFiles) {
+      check(1, 'critical', 'TOO_MANY_FILES', `Package contains ${allFiles.length} files, exceeds ${limits.maxFiles} limit`);
     }
 
     // ── Check 2: Manifest Zod validation ──
@@ -200,10 +214,25 @@ export class AppValidatorService {
         check(4, 'critical', 'SKILL_NAME_TOO_LONG', `Skill dir "${skill.dir}" exceeds 51 character limit`);
       }
     }
+    const groups = new Set<string>(PERMISSION_GROUPS);
     for (const perm of manifest.permissions ?? []) {
       if (!perm.id.startsWith(`${nsPrefix}:`)) {
         check(4, 'critical', 'PERM_NS_VIOLATION', `Permission id "${perm.id}" must start with nsPrefix "${nsPrefix}:"`);
       }
+      // MC12：分组供设置「应用权限」页显示，只能取固定的五个值
+      if (perm.group !== undefined && !groups.has(perm.group)) {
+        check(4, 'critical', 'PERM_GROUP_INVALID',
+          `Permission "${perm.id}" group "${perm.group}" is invalid; group must be one of ${PERMISSION_GROUPS.join(', ')}`);
+      }
+    }
+    // 30 §3.10：单个应用的权限项超过 300 警告（设置页仍可用但难以维护），超过 500 拒绝
+    const permCount = manifest.permissions?.length ?? 0;
+    if (permCount > PERMISSION_COUNT_MAX) {
+      check(4, 'critical', 'PERM_TOO_MANY',
+        `manifest declares ${permCount} permissions, exceeds the limit of ${PERMISSION_COUNT_MAX}`);
+    } else if (permCount > PERMISSION_COUNT_WARN) {
+      check(4, 'warning', 'PERM_MANY',
+        `manifest declares ${permCount} permissions (more than ${PERMISSION_COUNT_WARN}); consider merging permissions or splitting the app`);
     }
     // 细粒度权限引用闭包：tool/handler 声明的 permissionId 必须在 manifest.permissions 中声明
     const declaredPermIds = new Set((manifest.permissions ?? []).map(p => p.id));
@@ -362,11 +391,39 @@ export class AppValidatorService {
     }
 
     // ── Check 10.6: 首方能力门控（appstore:* / mcpExposed 仅首方 appId 可声明）──
-    const isFirstParty = /^com\.(jianzhi|menhu)\./.test(manifest.appId);
+    // MC10：旧首方前缀为保留命名空间，安装与升级都经本校验器，因此两者都被拒绝
+    if (isReservedAppId(manifest.appId)) {
+      check(10, 'critical', 'RESERVED_APP_ID_NAMESPACE',
+        `appId "${manifest.appId}" uses a reserved namespace (${RESERVED_NAMESPACE_LABEL}); first-party apps use io.jzai.*`);
+    }
+    const isFirstParty = isFirstPartyAppId(manifest.appId);
     const devCaps = (manifest.platformCapabilities ?? []).filter(c => c.startsWith('appstore:'));
     if (devCaps.length > 0 && !isFirstParty) {
       check(10, 'critical', 'DEV_CAP_NOT_FIRST_PARTY',
-        `platformCapabilities ${devCaps.join(', ')} requires a first-party appId (com.jianzhi.* / com.menhu.*), got "${manifest.appId}"`);
+        `platformCapabilities ${devCaps.join(', ')} requires a first-party appId (io.jzai.*), got "${manifest.appId}"`);
+    }
+    // MC13/MC16：platform:*（platform:temporal、platform:sandbox）是平台组件通道，只开放给首方包
+    const platformCaps = (manifest.platformCapabilities ?? []).filter(c => c.startsWith('platform:'));
+    if (platformCaps.length > 0 && !isFirstParty) {
+      check(10, 'critical', 'PLATFORM_CAP_NOT_FIRST_PARTY',
+        `platformCapabilities ${platformCaps.join(', ')} requires a first-party appId (io.jzai.*), got "${manifest.appId}"`);
+    }
+    // MC11：授权到期后的只读期只开放给首方包（到期后仍运行后端）
+    if (manifest.licensePolicy?.onExpired === 'readonly' && !isFirstParty) {
+      check(10, 'critical', 'LICENSE_POLICY_NOT_FIRST_PARTY',
+        `licensePolicy.onExpired "readonly" requires a first-party appId (io.jzai.*), got "${manifest.appId}"`);
+    }
+    // MC09：独立进程运行时只开放给首方包（子进程持有自己的连接池，且可携带原生依赖）
+    if (manifest.backend?.runtime === 'process' && !isFirstParty) {
+      check(10, 'critical', 'PROCESS_RUNTIME_NOT_FIRST_PARTY',
+        `backend.runtime "process" requires a first-party appId, got "${manifest.appId}"`);
+    }
+    // MC03：连接池上限 20 只开放给首方包（manifest schema 上限 20），第三方包仍为 5
+    const poolMax = manifest.database?.poolMax;
+    if (poolMax !== undefined && poolMax > THIRD_PARTY_POOL_MAX && !isFirstParty) {
+      check(10, 'critical', 'POOL_MAX_NOT_FIRST_PARTY',
+        `database.poolMax ${poolMax} exceeds ${THIRD_PARTY_POOL_MAX} for a third-party appId "${manifest.appId}"; ` +
+        `up to ${FIRST_PARTY_POOL_MAX} is allowed only for first-party apps (io.jzai.*)`);
     }
     const mcpExposedProviders = (manifest.backend?.toolProviders ?? []).filter(tp => tp.mcpExposed);
     if (mcpExposedProviders.length > 0 && !isFirstParty) {
@@ -587,6 +644,16 @@ export class AppValidatorService {
     }
     if (manifest.icon && this.isFileReferenceIcon(manifest.icon)) {
       validate(manifest.icon, 'file', 'app icon');
+    }
+
+    // ── MC07：待办快捷动作回调必须是已声明的 handler ──
+    const actionHandler = manifest.inbox?.actionHandler;
+    if (actionHandler !== undefined) {
+      const handlers = (manifest.backend?.controllers ?? []).flatMap(c => c.handlers ?? []);
+      if (!HANDLER_FORMAT.test(actionHandler) || !handlers.includes(actionHandler)) {
+        report('INBOX_ACTION_HANDLER_UNKNOWN',
+          `inbox.actionHandler "${actionHandler}" must be one of backend.controllers[].handlers`, actionHandler);
+      }
     }
 
     // ── 伴随服务引用闭包（PLAT-016）──

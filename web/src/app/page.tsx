@@ -18,9 +18,12 @@ import CoWorkerPanel from '@/modules/coworker/CoWorkerPanel';
 import CustomDashboardPanel from '@/components/dashboard/CustomDashboardPanel';
 import FloatingPanel from '@/components/FloatingPanel';
 import MyEmailPanel from '@/components/MyEmailPanel';
-import { DynamicPanelLoader } from '@/components/DynamicPanelLoader';
+import { DynamicPanelLoader, OPEN_PANEL_EVENT, type OpenPanelDetail } from '@/components/DynamicPanelLoader';
+import { applyDeepLink, parseDeepLink } from '@/lib/deep-link';
+import { toast } from 'sonner';
 import MobileShell from '@/components/mobile/MobileShell';
 import MobileAccessQr from '@/components/MobileAccessQr';
+import InboxBell from '@/components/inbox/InboxBell';
 import SessionList from '@/components/SessionList';
 import SidebarCustomizeModal from '@/components/SidebarCustomizeModal';
 import ShortcutCustomizeModal from '@/components/ShortcutCustomizeModal';
@@ -76,7 +79,10 @@ export default function Home() {
   // 从移动地址登录时始终手机模式；其他地址按视口宽度自动感知
   const isMobile = useIsMobile() || forceMobile;
   const msgDisplay = useMessageDisplay(activeAgent);
-  const { panels: sidebarPanels, save: saveSidebar, reset: resetSidebar } = useSidebar(token);
+  const { panels: sidebarPanels, loaded: sidebarLoaded, save: saveSidebar, reset: resetSidebar } = useSidebar(token);
+  // MC06：每个三方面板的面板内路由（深链 ?r=、sdk.nav.open、sdk.nav.setRoute）；首个面板列表到达后解析一次地址栏
+  const [panelRoutes, setPanelRoutes] = useState<Record<string, string | null>>({});
+  const deepLinkDoneRef = useRef(false);
   const { shortcuts, save: saveShortcuts, reset: resetShortcuts } = useShortcuts(token);
 
   // Single global chat — agentId determines which backend agent to use
@@ -491,6 +497,78 @@ export default function Home() {
     }
   }, [sidebarPanels]);
 
+  /**
+   * MC06：按面板 id 打开面板并带上面板内路由（地址栏深链与 sdk.nav.open 共用）。
+   * 桌面端按用户点击侧栏处理（handleNavigate，含配对智能体的既有规则）；移动端映射到现有的
+   * jianzhi:mobile-open-panel（detail 带 route），不支持移动端时提示。面板不存在或不可见时提示并返回 false。
+   */
+  const openPanelWithRoute = useCallback((panelId: string, route: string | null): boolean => {
+    const target = sidebarPanels.find(p => p.id === panelId);
+    if (!target) {
+      if (isMobile) {
+        window.dispatchEvent(new CustomEvent('jianzhi:mobile-notice', { detail: { text: '无权访问或面板不存在' } }));
+      } else {
+        toast.error('无权访问或面板不存在');
+      }
+      return false;
+    }
+    if (isMobile) {
+      if (target.mobile?.supported) {
+        window.dispatchEvent(new CustomEvent('jianzhi:mobile-open-panel', { detail: { panelId: target.id, route } }));
+      } else {
+        window.dispatchEvent(new CustomEvent('jianzhi:mobile-notice', {
+          detail: { text: `「${target.name}」暂不支持移动端` } }));
+      }
+      return true;
+    }
+    if (target.category === 'third_party') {
+      setPanelRoutes(prev => (prev[target.id] === route ? prev : { ...prev, [target.id]: route }));
+    }
+    handleNavigate(target.id);
+    return true;
+  }, [sidebarPanels, isMobile, handleNavigate]);
+
+  // MC06：地址栏同步（只用 replaceState，后退键行为不变）。打开三方面板时写 ?panel=&r=，切到内置面板或聊天时移除。
+  // 须声明在首次解析之前：解析完成的同一轮提交里本效果先跑、仍处于未解析状态，不会抢先清掉地址栏参数
+  useEffect(() => {
+    if (!deepLinkDoneRef.current || isMobile || typeof window === 'undefined') return;
+    const type = contentPanel?.type;
+    const panel = type ? sidebarPanels.find(p => p.id === type) : undefined;
+    const link = panel && panel.category === 'third_party'
+      ? { panelId: panel.id, route: panelRoutes[panel.id] ?? null }
+      : null;
+    const next = applyDeepLink(window.location.search, link);
+    if (next !== window.location.search) {
+      window.history.replaceState(window.history.state, '', `${window.location.pathname}${next}${window.location.hash}`);
+    }
+  }, [contentPanel?.type, panelRoutes, sidebarPanels, isMobile]);
+
+  // MC06：首个面板列表到达后解析一次地址栏深链；面板不存在或不可见时提示并移除参数。
+  // 移动端不做地址栏同步，打开后也移除参数，避免之后地址栏停留在过期的面板与路由上
+  useEffect(() => {
+    if (deepLinkDoneRef.current || !sidebarLoaded || typeof window === 'undefined') return;
+    deepLinkDoneRef.current = true;
+    const search = window.location.search;
+    const link = parseDeepLink(search);
+    // 地址栏是外部状态，只在面板列表首次到达时读一次，这里打开面板属于有意为之
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    const opened = link ? openPanelWithRoute(link.panelId, link.route) : false;
+    if ((!opened || isMobile) && /(^|[?&])(panel|r)=/.test(search)) {
+      window.history.replaceState(window.history.state, '', `${window.location.pathname}${applyDeepLink(search, null)}${window.location.hash}`);
+    }
+  }, [sidebarLoaded, openPanelWithRoute, isMobile]);
+
+  // MC06：面板经 sdk.nav.open 请求打开另一个面板
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<OpenPanelDetail>).detail;
+      if (!detail?.panelId) return;
+      openPanelWithRoute(detail.panelId, detail.route ?? null);
+    };
+    window.addEventListener(OPEN_PANEL_EVENT, handler);
+    return () => window.removeEventListener(OPEN_PANEL_EVENT, handler);
+  }, [openPanelWithRoute]);
+
   // Listen for agent UI control actions (ABC framework)
   useEffect(() => {
     const handler = (e: Event) => {
@@ -824,6 +902,10 @@ export default function Home() {
                         { id: p.id, sourceAppId: p.sourceAppId, agentId: p.agentId },
                         msg,
                       )}
+                      route={panelRoutes[p.id] ?? null}
+                      onRouteChange={nextRoute => setPanelRoutes(prev => (
+                        prev[p.id] === nextRoute ? prev : { ...prev, [p.id]: nextRoute }
+                      ))}
                     />
                   </div>
                 ))}
@@ -917,6 +999,9 @@ export default function Home() {
             )}
             <div className="mr-2">
               <MobileAccessQr url={mobileAccessUrl} />
+            </div>
+            <div className="mr-2">
+              <InboxBell token={token} />
             </div>
             <div className="relative group">
               <div className="w-8 h-8 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-semibold cursor-pointer">

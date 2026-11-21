@@ -17,6 +17,18 @@ import { McpRegistryService } from '../../capability/mcp/mcp-registry.service';
 import { CompanionServiceManager } from '../../platform/app-store/runtime/companion-service.manager';
 import { ResourceAccessService } from '../../platform/authz/resource-access.service';
 import { ResourceGrantService } from '../../platform/authz/resource-grant.service';
+import { CONFIRM_TIMEOUT, ConfirmationBridgeService } from '../support/confirmation-bridge.service';
+import { randomUUID } from 'crypto';
+
+/** 应用工具人工确认的错误码（MC04），与 FORBIDDEN 等一样放在 details.__error.code */
+export const CONFIRM_UNAVAILABLE = 'CONFIRM_UNAVAILABLE';
+export const CONFIRM_REJECTED = 'CONFIRM_REJECTED';
+
+/** 确认请求归属：谁来确认、确认框发到哪个会话 */
+interface ConfirmContext {
+  userId?: string;
+  sessionId?: string;
+}
 
 /**
  * ToolBridgeService — collects all ToolProviders and builds tool sets for agents.
@@ -43,6 +55,8 @@ export class ToolBridgeService {
     @Optional() private readonly companionManager?: CompanionServiceManager,
     @Optional() private readonly authzAccess?: ResourceAccessService,
     @Optional() private readonly authzGrants?: ResourceGrantService,
+    // MC04：应用工具声明 confirm 时由这里统一发起人工确认；未接线（单测直构）时跳过确认并告警一次
+    @Optional() private readonly confirmBridge?: ConfirmationBridgeService,
   ) {
     for (const p of (this.providers || [])) {
       for (const id of p.toolIds) {
@@ -217,8 +231,11 @@ export class ToolBridgeService {
       if (removed > 0) this.logger.log(`P2 scheduler skip_tool: 剔除 ${removed} 个 confirm 工具（${principal.principalId}）`);
     }
 
-    // Global safety wrapper: auth + truncation + error catch
-    return this.wrapWithSafety(authzFiltered, principal, maxToolOutputChars);
+    // Global safety wrapper: auth + confirm + truncation + error catch
+    return this.wrapWithSafety(authzFiltered, principal, maxToolOutputChars, {
+      userId: fullCtx.userId,
+      sessionId: ctx.sessionId,
+    });
   }
 
   /**
@@ -348,12 +365,21 @@ export class ToolBridgeService {
     tools: ToolInstance[],
     principalInput?: InvocationPrincipalInput,
     maxToolOutputChars?: number,
+    confirmCtx: ConfirmContext = {},
   ): ToolInstance[] {
     const principal = normalizeInvocationPrincipal(principalInput, 'legacy-tool-execution');
     return tools.map(tool => ({
       ...tool,
       execute: async (...args: any[]) => {
         const ownerApp = this.dynamicRegistry?.getOwnerApp(tool.name);
+        // MC11：授权到期且不在只读期（只读期内照常转发，由应用自行拒绝写入）
+        if (ownerApp && this.dynamicRegistry?.isLicenseBlocked?.(ownerApp)) {
+          const message = `APP_LICENSE_EXPIRED: app ${ownerApp} license has expired`;
+          return {
+            content: [{ type: 'text' as const, text: message }],
+            details: { __error: { code: 'APP_LICENSE_EXPIRED', message } },
+          };
+        }
         if (ownerApp && this.dynamicRegistry?.isDraining(ownerApp)) {
           return {
             content: [{ type: 'text' as const, text: `Conflict: app ${ownerApp} is deactivating` }],
@@ -376,6 +402,13 @@ export class ToolBridgeService {
             details: { __error: { code: 'FORBIDDEN', message: `No grant for app ${ownerApp}` } },
           };
         }
+        // MC04：应用工具声明 confirm 时，授权通过后、执行前由用户确认；确认后以返回的参数执行
+        if (ownerApp && tool.confirm === true) {
+          const confirmed = await this.confirmAppTool(tool, ownerApp, principal, args[1], confirmCtx);
+          if (!confirmed.ok) return confirmed.result;
+          args = [...args];
+          args[1] = confirmed.params;
+        }
         try {
           const result = await tool.execute(...args);
           return this.truncateToolResult(result, tool.name, maxToolOutputChars);
@@ -390,6 +423,82 @@ export class ToolBridgeService {
         }
       },
     }));
+  }
+
+  private warnedNoConfirmBridge = false;
+
+  /**
+   * 应用工具的人工确认（MC04）。只有能找到确认人的调用才发起确认：
+   * - 用户主体：确认人为该用户，确认框发到所在会话；
+   * - 定时任务（system 主体，origin = scheduler）：确认人为 runAsUser，reject 模式由无头运行按会话号自动拒绝；
+   * - 开发 MCP、服务主体、其他系统主体与委托调用，以及没有会话号的直接调用：没有可以弹框的人，返回 CONFIRM_UNAVAILABLE。
+   * 取消或超时返回 CONFIRM_REJECTED（details 同时带 __confirmCancelled，沿用智能体循环对确认取消的处理）。
+   */
+  private async confirmAppTool(
+    tool: ToolInstance,
+    ownerApp: string,
+    principal: InvocationPrincipal | undefined,
+    params: unknown,
+    ctx: ConfirmContext,
+  ): Promise<{ ok: true; params: unknown } | { ok: false; result: any }> {
+    if (!this.confirmBridge) {
+      if (!this.warnedNoConfirmBridge) {
+        this.warnedNoConfirmBridge = true;
+        this.logger.warn('ConfirmationBridgeService 未接线：应用工具的 confirm 声明被跳过');
+      }
+      return { ok: true, params };
+    }
+    const owner = this.confirmOwner(principal, ctx);
+    if (!owner) {
+      const message = `工具 ${tool.name} 需要用户确认，当前调用方（${principal?.type ?? '无身份'}）无法弹出确认`;
+      return {
+        ok: false,
+        result: {
+          content: [{ type: 'text' as const, text: `[${CONFIRM_UNAVAILABLE}] ${message}` }],
+          details: { __error: { code: CONFIRM_UNAVAILABLE, message, retryable: false } },
+        },
+      };
+    }
+    const args = params && typeof params === 'object' ? params as Record<string, any> : {};
+    try {
+      const edited = await this.confirmBridge.requestConfirmation({
+        confirmId: `app_${tool.name}_${Date.now()}_${randomUUID().slice(0, 8)}`,
+        toolName: tool.name,
+        args,
+        parameters: confirmParametersOf(tool.parameters),
+        description: tool.description,
+        userId: owner.userId,
+        sessionId: owner.sessionId,
+      });
+      // 前端确认时回传完整参数；回复未带参数（空对象）时沿用原参数
+      return { ok: true, params: edited && Object.keys(edited).length > 0 ? edited : args };
+    } catch (err: any) {
+      const timedOut = err?.message === CONFIRM_TIMEOUT;
+      const message = timedOut ? '确认超时，操作已取消' : '用户取消了此操作';
+      this.logger.log(`App tool ${tool.name} (${ownerApp}) not confirmed: ${timedOut ? 'timeout' : 'cancelled'}`);
+      return {
+        ok: false,
+        result: {
+          content: [{ type: 'text' as const, text: `[${CONFIRM_REJECTED}] ${message}` }],
+          details: {
+            __error: { code: CONFIRM_REJECTED, message, retryable: false },
+            __confirmCancelled: true,
+            __userCancelled: !timedOut,
+          },
+        },
+      };
+    }
+  }
+
+  private confirmOwner(principal: InvocationPrincipal | undefined, ctx: ConfirmContext): Required<ConfirmContext> | null {
+    if (!principal || !ctx.sessionId) return null;
+    if (principal.type === 'user' && principal.userId) {
+      return { userId: principal.userId, sessionId: ctx.sessionId };
+    }
+    if (principal.type === 'system' && principal.origin === 'scheduler' && ctx.userId) {
+      return { userId: ctx.userId, sessionId: ctx.sessionId };
+    }
+    return null;
   }
 
   private async checkToolAccess(appId: string, principal?: InvocationPrincipal, toolId?: string): Promise<boolean> {
@@ -538,4 +647,20 @@ export class ToolBridgeService {
     } catch { /* not valid JSON — fall through to plain truncation */ }
     return text.slice(0, maxChars) + `\n\n...(截断，原文共 ${origLen} 字符)`;
   }
+}
+
+/** 由工具参数的 JSON Schema（TypeBox 或普通对象）生成确认框的参数列表 */
+export function confirmParametersOf(
+  schema: unknown,
+): { name: string; type: string; required?: boolean; description?: string }[] {
+  const s = schema as { properties?: Record<string, any>; required?: unknown } | undefined;
+  const properties = s && typeof s === 'object' && s.properties && typeof s.properties === 'object' ? s.properties : {};
+  const required = new Set(Array.isArray(s?.required) ? (s!.required as string[]) : []);
+  return Object.entries(properties).map(([name, prop]) => {
+    const type = typeof prop?.type === 'string' ? prop.type : Array.isArray(prop?.type) ? String(prop.type[0]) : 'string';
+    const entry: { name: string; type: string; required?: boolean; description?: string } = { name, type };
+    if (required.has(name)) entry.required = true;
+    if (typeof prop?.description === 'string') entry.description = prop.description;
+    return entry;
+  });
 }

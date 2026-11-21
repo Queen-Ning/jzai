@@ -49,7 +49,7 @@ describe('PackageSignatureService & AppLicense (crypto roundtrip)', () => {
     canonicalFn = mod.canonicalSignaturePayload;
 
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jzsig-'));
-    writeFile('manifest.json', '{"appId":"com.jianzhi.test"}');
+    writeFile('manifest.json', '{"appId":"io.jzai.test"}');
     writeFile('dist/index.js', 'console.log(1)');
   });
 
@@ -113,7 +113,7 @@ describe('PackageSignatureService & AppLicense (crypto roundtrip)', () => {
     const STATIC_KEY_IKM = 'jz-license-v2-7f3a9c1e5b48d206e9f1a3c5';
     const aesKey = Buffer.from(hkdfSync('sha256', STATIC_KEY_IKM, 'jianzhi-license-v2', 'aes-key', 32));
     const payload = {
-      type: 'app', version: 1, installationId: 'inst-1', appId: 'com.jianzhi.test',
+      type: 'app', version: 1, installationId: 'inst-1', appId: 'io.jzai.test',
       period: 'monthly', issuedAt: Math.floor(Date.now() / 1000),
       expiresAt: Math.floor(Date.now() / 1000) + 86400,
     };
@@ -125,14 +125,14 @@ describe('PackageSignatureService & AppLicense (crypto roundtrip)', () => {
     const licenseStr = Buffer.concat([signature, blob]).toString('base64');
 
     const appLicense = require('../../../edition/app-license');
-    const verified = appLicense.verifyAppLicense(licenseStr, 'inst-1', 'com.jianzhi.test');
-    expect(verified.appId).toBe('com.jianzhi.test');
+    const verified = appLicense.verifyAppLicense(licenseStr, 'inst-1', 'io.jzai.test');
+    expect(verified.appId).toBe('io.jzai.test');
     expect(appLicense.isAppLicenseExpired(verified)).toBe(false);
 
     // installationId 不符
-    expect(() => appLicense.verifyAppLicense(licenseStr, 'inst-2', 'com.jianzhi.test')).toThrow();
+    expect(() => appLicense.verifyAppLicense(licenseStr, 'inst-2', 'io.jzai.test')).toThrow();
     // appId 不符
-    expect(() => appLicense.verifyAppLicense(licenseStr, 'inst-1', 'com.jianzhi.other')).toThrow();
+    expect(() => appLicense.verifyAppLicense(licenseStr, 'inst-1', 'io.jzai.other')).toThrow();
     // 过期判定
     expect(appLicense.isAppLicenseExpired({ ...verified, expiresAt: 1 })).toBe(true);
     // 平台 license payload 不能被当作 APP license
@@ -142,6 +142,6 @@ describe('PackageSignatureService & AppLicense (crypto roundtrip)', () => {
     const encrypted2 = Buffer.concat([cipher2.update(Buffer.from(JSON.stringify(platformPayload))), cipher2.final()]);
     const blob2 = Buffer.concat([iv2, cipher2.getAuthTag(), encrypted2]);
     const platformLicense = Buffer.concat([sign(null, blob2, privateKey), blob2]).toString('base64');
-    expect(() => appLicense.verifyAppLicense(platformLicense, 'inst-1', 'com.jianzhi.test')).toThrow('Not an app license');
+    expect(() => appLicense.verifyAppLicense(platformLicense, 'inst-1', 'io.jzai.test')).toThrow('Not an app license');
   });
 });

@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { createHash, createPublicKey, verify } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { isFirstPartyAppId } from '../first-party';
 
 export type PackageSignatureStatus = 'valid' | 'unsigned' | 'invalid';
 
@@ -33,6 +34,59 @@ export function canonicalSignaturePayload(files: Record<string, string>): string
   const sorted: Record<string, string> = {};
   for (const key of Object.keys(files).sort()) sorted[key] = files[key];
   return JSON.stringify({ files: sorted });
+}
+
+/**
+ * 只验签名清单本身（Ed25519，官方公钥）：不读文件、不比对哈希。
+ * verifyDirectory 的第 1 步；SafeArchiveService 解包前用它判断能否使用首方上限（MC17）。
+ */
+export function verifySignedFileList(
+  envelope: { files?: Record<string, string>; signature?: string } | null | undefined,
+): PackageSignatureResult {
+  if (!envelope || !envelope.files || typeof envelope.files !== 'object' || !envelope.signature) {
+    return { status: 'invalid', detail: 'PACKAGE-SIGNATURE.json 缺少 files 或 signature' };
+  }
+  try {
+    const canonical = canonicalSignaturePayload(envelope.files);
+    const pubKey = createPublicKey(EMBEDDED_PACKAGE_PUBLIC_KEY);
+    if (!verify(null, Buffer.from(canonical, 'utf-8'), pubKey, Buffer.from(envelope.signature, 'base64'))) {
+      return { status: 'invalid', detail: '签名验签失败（清单被替换或密钥不符）' };
+    }
+  } catch (err: any) {
+    return { status: 'invalid', detail: `签名验签异常: ${err.message}` };
+  }
+  return { status: 'valid' };
+}
+
+/** 读取签名文件时的上限，与 SafeArchiveService 预检相同 */
+const MAX_SIGNATURE_FILE_BYTES = 8 * 1024 * 1024;
+
+/**
+ * MC17：解包后的目录是否为「官方签名有效、签名清单与文件集合一致、manifest.json 与清单哈希一致、appId 为首方」的包。
+ * 判定条件与 SafeArchiveService.selectLimits 相同，供 AppValidatorService 选择体积上限；
+ * 不逐个文件计算哈希，逐文件比对仍由调用方的 verifyDirectory 完成。任何异常都返回 false。
+ *
+ * @param relFiles 目录中全部普通文件的相对路径（posix 分隔符，含签名文件）
+ */
+export function isFirstPartySignedTree(extractDir: string, relFiles: Iterable<string>): boolean {
+  try {
+    const sigPath = path.join(extractDir, SIGNATURE_FILE);
+    const sigStat = fs.lstatSync(sigPath);
+    if (!sigStat.isFile() || sigStat.size > MAX_SIGNATURE_FILE_BYTES) return false;
+    const envelope = JSON.parse(fs.readFileSync(sigPath, 'utf-8'));
+    if (verifySignedFileList(envelope).status !== 'valid') return false;
+    const files = envelope.files as Record<string, string>;
+    const manifest = fs.readFileSync(path.join(extractDir, 'manifest.json'));
+    if (createHash('sha256').update(manifest).digest('hex') !== files['manifest.json']) return false;
+    if (!isFirstPartyAppId(JSON.parse(manifest.toString('utf-8'))?.appId)) return false;
+    const actual = new Set(relFiles);
+    actual.delete(SIGNATURE_FILE);
+    const listed = Object.keys(files);
+    if (listed.length !== actual.size) return false;
+    return listed.every(name => actual.has(name));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -75,26 +129,16 @@ export class PackageSignatureService {
     } catch {
       return { status: 'invalid', detail: 'PACKAGE-SIGNATURE.json 无法解析' };
     }
-    if (!envelope.files || typeof envelope.files !== 'object' || !envelope.signature) {
-      return { status: 'invalid', detail: 'PACKAGE-SIGNATURE.json 缺少 files 或 signature' };
-    }
-
     // 1. Ed25519 验签清单
-    try {
-      const canonical = canonicalSignaturePayload(envelope.files);
-      const pubKey = createPublicKey(EMBEDDED_PACKAGE_PUBLIC_KEY);
-      if (!verify(null, Buffer.from(canonical, 'utf-8'), pubKey, Buffer.from(envelope.signature, 'base64'))) {
-        return { status: 'invalid', detail: '签名验签失败（清单被替换或密钥不符）' };
-      }
-    } catch (err: any) {
-      return { status: 'invalid', detail: `签名验签异常: ${err.message}` };
-    }
+    const listResult = verifySignedFileList(envelope);
+    if (listResult.status !== 'valid') return listResult;
+    const files = envelope.files!;
 
     // 2. 文件集合一致性（防新增/删除）
     const actual = new Set<string>();
     this.walk(extractDir, extractDir, actual);
     actual.delete(SIGNATURE_FILE);
-    const listed = new Set(Object.keys(envelope.files));
+    const listed = new Set(Object.keys(files));
     for (const f of actual) {
       if (!listed.has(f)) return { status: 'invalid', detail: `存在未签名文件: ${f}` };
     }
@@ -103,7 +147,7 @@ export class PackageSignatureService {
     }
 
     // 3. 逐文件 sha256 比对（防修改）
-    for (const [rel, expected] of Object.entries(envelope.files)) {
+    for (const [rel, expected] of Object.entries(files)) {
       const full = path.join(extractDir, rel);
       // 防路径穿越
       if (!path.resolve(full).startsWith(path.resolve(extractDir) + path.sep)) {

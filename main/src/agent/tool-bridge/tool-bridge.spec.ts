@@ -334,6 +334,36 @@ describe('ToolBridgeService', () => {
       expect(result.content[0].text).toBe('ok');
     });
 
+    // T-P-18（MC11）：授权到期且不在只读期 → APP_LICENSE_EXPIRED，管理员也不放行，且不触达应用
+    test('license-blocked app tool returns APP_LICENSE_EXPIRED before any access check', async () => {
+      const execute = jest.fn(async () => ({ content: [{ type: 'text' as const, text: 'ok' }] }));
+      const dynamicProvider: ToolProvider = {
+        toolIds: ['app_tool'],
+        getCatalog: () => [],
+        createTools: async () => [{ name: 'app_tool', description: '', parameters: {}, execute }],
+      };
+      const registry = new DynamicToolProviderRegistry();
+      registry.register('app_1', [dynamicProvider]);
+      const userService = { getUser: async () => ({ role: { permissions: ['sys:admin'] } }) } as any;
+      const appGrantService = { hasAppAccessForPrincipal: async () => true, getRequiredToolPermission: async () => undefined } as any;
+      const bridge = new ToolBridgeService([], registry, appGrantService, userService);
+      await bridge.init({});
+      const tools = await bridge.buildForAgent(['app_tool'], { userId: 'u1' });
+
+      registry.setLicenseBlocked('app_1', true);
+      const blocked = await tools[0].execute('id', {});
+      expect(blocked.content[0].text).toContain('APP_LICENSE_EXPIRED');
+      expect((blocked as any).details.__error.code).toBe('APP_LICENSE_EXPIRED');
+      expect(execute).not.toHaveBeenCalled();
+
+      // 续订恢复后解除拦截；unregister 不清除拦截标记（停用与拦截并行生效）
+      registry.setLicenseBlocked('app_1', false);
+      expect((await tools[0].execute('id', {})).content[0].text).toBe('ok');
+      registry.setLicenseBlocked('app_1', true);
+      registry.unregister('app_1');
+      expect(registry.isLicenseBlocked('app_1')).toBe(true);
+    });
+
     test('app-owned tool allowed with explicit grant', async () => {
       const dynamicProvider: ToolProvider = {
         toolIds: ['app_tool'],

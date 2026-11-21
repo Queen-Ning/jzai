@@ -82,10 +82,30 @@ export function createServicePrincipal(
   });
 }
 
-export function createDevMcpPrincipal(actorId: string): InvocationPrincipal {
+/** 开发 MCP 调用所代表的用户（令牌签发人，MC01） */
+export interface DevMcpOnBehalfOf {
+  userId: string;
+  roleIds?: readonly string[];
+  departmentIds?: readonly string[];
+  permissions?: readonly string[];
+}
+
+/**
+ * 开发 MCP 主体。type 与 scopes 固定（ToolBridge 按 app:invoke 放行）；
+ * 传入 onBehalfOf 时带上签发人的用户身份，工具可从 ctx.principal.userId 取得操作人，
+ * delegatedBy 记录这次调用由哪个用户授权。
+ */
+export function createDevMcpPrincipal(actorId: string, onBehalfOf?: DevMcpOnBehalfOf): InvocationPrincipal {
   return createInvocationPrincipal({
     type: 'dev-mcp',
     principalId: actorId.startsWith('dev-mcp:') ? actorId : `dev-mcp:${actorId}`,
+    ...(onBehalfOf ? {
+      userId: onBehalfOf.userId,
+      roleIds: onBehalfOf.roleIds,
+      departmentIds: onBehalfOf.departmentIds,
+      permissions: onBehalfOf.permissions,
+      delegatedBy: onBehalfOf.userId,
+    } : {}),
     scopes: ['app:invoke'],
     origin: 'dev-mcp',
     issuedAt: Date.now(),

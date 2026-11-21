@@ -5,7 +5,11 @@ import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { AppManifest } from '../validators/manifest.schema';
 import { AppRegistryService } from './app-registry.service';
-import { AppPoolService } from './app-pool.service';
+import { AppPoolService, parentPoolMax } from './app-pool.service';
+import { VALID_LICENSE, listPlatformMethods } from '../runtime/process/protocol';
+import { hasInboxCapability } from '../../inbox/inbox.types';
+import type { AppInboxClient } from '../../inbox/inbox.types';
+import { AppLicenseRuntimeService } from './app-license-runtime.service';
 import { AppSchemaService } from './app-schema.service';
 import { DynamicModuleLoader } from '../runtime/dynamic-module.loader';
 import type { AppDeactivateReason } from '../runtime/dynamic-module.loader';
@@ -55,10 +59,15 @@ export class AppActivationService {
     private readonly spaces: SpacesService,
   ) {}
 
-  /** Activate all apps marked active in the registry. Called once at startup. */
+  /**
+   * Activate all apps marked active in the registry. Called once at startup.
+   * MC11：授权已到期但仍在只读期内的应用同样激活（AppLicenseRuntimeService.shouldActivate 同时登记授权状态）。
+   */
   async activateAll(): Promise<void> {
     const apps = await this.registry.findAll();
-    for (const app of apps.filter(a => a.status === 'active')) {
+    const licenses = this.getLicenseRuntime();
+    const toActivate = apps.filter(a => (licenses ? licenses.shouldActivate(a) : a.status === 'active'));
+    for (const app of toActivate) {
       try {
         const installDir = await this.ensureVersionedLayout(app.appId, app.installDir || '', app.version);
         await this.activateApp(app.appId, installDir, app.manifest);
@@ -190,7 +199,7 @@ export class AppActivationService {
         ...connection,
         user: this.schema.getRoleName(manifest)!,
         password: rolePassword,
-        max: manifest.database.poolMax ?? 3,
+        max: parentPoolMax(manifest),
       });
       this.logger.log(`Rebuilt database pool for app ${appId} (role password rotated)`);
     } catch (err: any) {
@@ -236,6 +245,23 @@ export class AppActivationService {
       } catch (err: any) {
         this.logger.warn(`Failed to stop companion services for ${appId}: ${err.message}`);
       }
+      // MC16：宿主或托管应用停用（升级、卸载、授权到期、关机）时回收它们的插件制品；新版本激活后由宿主重新准备
+      try {
+        await this.getSandboxService()?.disposeForApp(appId, reason);
+      } catch (err: any) {
+        this.logger.warn(`Failed to dispose sandbox artifacts for ${appId}: ${err.message}`);
+      }
+    }
+  }
+
+  /** MC16：SandboxModule 在 AppStoreModule 之外，类在用到时才 require */
+  private getSandboxService(): { disposeForApp(appId: string, reason: string): Promise<number> } | undefined {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { SandboxService } = require('../../sandbox/sandbox.service');
+      return this.getPlatformService(SandboxService) as { disposeForApp(appId: string, reason: string): Promise<number> } | undefined;
+    } catch {
+      return undefined;
     }
   }
 
@@ -430,8 +456,19 @@ export class AppActivationService {
         : undefined,
       connections: connectionBindings?.createServiceClient(appId),
       platform: this.appPlatform.buildFacade(manifest),
+      license: () => this.getLicenseRuntime()?.getState(appId) ?? { ...VALID_LICENSE },
+      // MC07：只在声明 inbox:publish 时注入，appId 由平台绑定
+      inbox: hasInboxCapability(manifest) ? this.getInboxService()?.clientFor(appId) : undefined,
     });
-    const loaded = await this.loader.load(appId, entry, manifest.backend.module, ctx);
+    const loaded = manifest.backend.runtime === 'process'
+      ? await this.loader.load(appId, entry, manifest.backend.module, ctx, {
+          runtime: 'process',
+          process: this.buildProcessSpec(
+            appId, installDir, entry, manifest, config as Record<string, unknown>, ctx, !!connectionBindings,
+            record?.shortName ?? manifest.shortName,
+          ),
+        })
+      : await this.loader.load(appId, entry, manifest.backend.module, ctx);
     const providers = ((loaded.moduleRef as any)?.toolProviders ?? []) as ToolProvider[];
 
     // manifest.backend.toolProviders[].tokenLimits 是声明式来源（决策 11），
@@ -453,6 +490,42 @@ export class AppActivationService {
   }
 
   /**
+   * 独立进程应用（MC09）的子进程 init 规格。父进程照旧构造 AppContext 作为宿主上下文，
+   * 子进程只拿到可序列化的部分：已解析的配置、本应用角色的连接参数（每次建池轮换口令）、
+   * 工作区根、平台工具白名单与首方门面的方法清单。
+   */
+  private buildProcessSpec(
+    appId: string,
+    installDir: string,
+    entry: string,
+    manifest: AppManifest,
+    config: Record<string, unknown>,
+    ctx: AppContext,
+    hasConnections: boolean,
+    shortName: string,
+  ) {
+    const creds = manifest.database ? this.pools.getCredentials(appId) : undefined;
+    return {
+      init: {
+        appId,
+        installDir,
+        entry,
+        moduleName: manifest.backend!.module,
+        config,
+        db: creds ? { ...creds, max: manifest.database?.poolMax ?? 3 } : undefined,
+        workspaceRoot: this.workspace.getRoot(),
+        shortName,
+        usesPlatformTools: manifest.usesPlatformTools ?? [],
+        platformMethods: listPlatformMethods(ctx.platform),
+        hasConnections,
+        license: ctx.license.getState(),
+        hasInbox: !!ctx.inbox,
+      },
+      process: manifest.backend?.process,
+    };
+  }
+
+  /**
    * Skill 工具（skill_<dir名>）由平台 SkillToolProvider 静态创建，不属于扩展包 provider，
    * 它们的输出截断上限只能经 manifest.skills[].tokenLimit 声明并在此写入注册表。
    * （同时把工具归属记到 appId，未授权用户调用技能时会被 ToolBridge 拦截。）
@@ -471,6 +544,22 @@ export class AppActivationService {
 
   private getToolRegistry(): DynamicToolProviderRegistry | undefined {
     return this.getPlatformService(DynamicToolProviderRegistry);
+  }
+
+  /** MC11：经全局容器惰性取得（AppLicenseRuntimeService 反过来依赖本服务） */
+  private getLicenseRuntime(): AppLicenseRuntimeService | undefined {
+    return this.getPlatformService(AppLicenseRuntimeService);
+  }
+
+  /** MC07：InboxModule 依赖本模块，类在用到时才 require，避免文件间循环引用 */
+  private getInboxService(): { clientFor(appId: string): AppInboxClient } | undefined {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { InboxService } = require('../../inbox/inbox.service');
+      return this.getPlatformService(InboxService) as { clientFor(appId: string): AppInboxClient } | undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private getPanelService(): PanelService | undefined {
