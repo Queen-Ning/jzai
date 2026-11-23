@@ -3,7 +3,7 @@ import { DbService } from '../../db/db.service';
 import { ScheduledTaskService } from './scheduled-task.service';
 import type { TaskInput } from './scheduled-task.service';
 import { TaskRunnerService } from './task-runner.service';
-import { RequireAdmin } from '../authz/require-permission.decorator';
+import { RequirePermission } from '../authz/require-permission.decorator';
 import { ResourceAccessService } from '../authz/resource-access.service';
 import { AgentRegistryService } from '../../agent/core/agent-registry.service';
 import { SkillRegistryService } from '../../capability/skill/skill-registry.service';
@@ -16,7 +16,7 @@ import type { InvocationPrincipal } from '../app-store/runtime/invocation-princi
  * （防 admin 替无权用户配置越权任务——执行期 principal 是 system，授权链锚点在创建时校验）。
  */
 @Controller('api/scheduler/tasks')
-@RequireAdmin()
+@RequirePermission('cfg:timer')
 export class ScheduledTaskController {
   private readonly logger = new Logger(ScheduledTaskController.name);
 

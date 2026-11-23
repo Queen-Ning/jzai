@@ -85,16 +85,21 @@ export default function SettingsPanel() {
   const [saving, setSaving] = useState(false);
   const token = getToken();
   const { user: authUser } = useAuth();
-  const canManageUsers = (() => {
-    if (!authUser) return false;
-    const perms = typeof authUser.role === 'string' ? [] : (authUser.role?.permissions ?? []);
-    return perms.includes('cfg:users') || perms.includes('sys:admin');
-  })();
   const isSysAdmin = (() => {
     if (!authUser) return false;
     const perms = typeof authUser.role === 'string' ? [] : (authUser.role?.permissions ?? []);
     return perms.includes('sys:admin');
   })();
+  // 设置面板分签授权：sys:admin 直通，否则按 cfg:* 分签权限逐项判定
+  const hasCfg = (p: string) => {
+    if (!authUser) return false;
+    const perms = typeof authUser.role === 'string' ? [] : (authUser.role?.permissions ?? []);
+    return perms.includes('sys:admin') || perms.includes(p);
+  };
+  const TAB_PERMS: Record<string, string> = {
+    model: 'cfg:model', toolMgmt: 'cfg:tools', timer: 'cfg:timer', analytics: 'cfg:analytics',
+    oem: 'cfg:oem', users: 'cfg:users', appPerms: 'cfg:appPerms', general: 'cfg:general',
+  };
   const { shortcuts, save: saveShortcuts, reset: resetShortcuts } = useShortcuts(token);
   const { panels: sidebarPanels } = useSidebar(token);
   const [editItems, setEditItems] = useState<typeof shortcuts | null>(null);
@@ -396,7 +401,7 @@ export default function SettingsPanel() {
   return (
     <div className="p-6 overflow-y-auto h-full">
       <div className="flex gap-2 mb-6">
-        {([['model', t('settings.models')], ['toolMgmt', '工具管理'], ['timer', '定时任务'], ['credentials', '系统凭证'], ['analytics', '运营分析'], ['oem', '三方扩展'], ['users', '用户与组织'], ['appPerms', '应用权限'], ['general', '系统通用']] as const).filter(([tab]) => tab !== 'credentials' && (tab !== 'users' || canManageUsers) && (tab !== 'timer' || isSysAdmin) && (tab !== 'appPerms' || isSysAdmin)).map(([tab, label]) => (
+        {([['model', t('settings.models')], ['toolMgmt', '工具管理'], ['timer', '定时任务'], ['credentials', '系统凭证'], ['analytics', '运营分析'], ['oem', '三方扩展'], ['users', '用户与组织'], ['appPerms', '应用权限'], ['general', '系统通用']] as const).filter(([tab]) => tab !== 'credentials' && hasCfg(TAB_PERMS[tab])).map(([tab, label]) => (
           <button key={tab} onClick={() => {
             setActiveTab(tab);
             if (tab === 'toolMgmt') {
@@ -1358,7 +1363,7 @@ export default function SettingsPanel() {
         </div>
       )}
 
-      {activeTab === 'timer' && isSysAdmin && (
+      {activeTab === 'timer' && hasCfg('cfg:timer') && (
         <TimerPanel />
       )}
 
@@ -1396,7 +1401,7 @@ export default function SettingsPanel() {
       )}
 
       {/* MC12（T-P-20）：应用权限，仅管理员；接口同样只给管理员 */}
-      {activeTab === 'appPerms' && isSysAdmin && (
+      {activeTab === 'appPerms' && hasCfg('cfg:appPerms') && (
         <div className="h-[calc(100%-3.5rem)]">
           <AppPermissionsPanel />
         </div>

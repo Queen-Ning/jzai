@@ -504,7 +504,7 @@ docker compose down
           serverId: HOST_TOOL_SERVER_ID,
           serverName: '主台MCP连接',
           source: 'host',
-          description: '见智连接大师创建的内部系统MCP连接',
+          description: '荐智连接大师创建的内部系统MCP连接',
           tools: mcpHostTools.map(t => ({ name: t.id, description: `${normalizeHostGroup(t.group)}/${t.label}` })),
         });
       }
@@ -528,9 +528,9 @@ docker compose down
     if (mainPlatformTools.length) {
       mcp.push({
         serverId: KB_TOOL_SERVER_ID,
-        serverName: '见智知识库',
+        serverName: '荐智知识库',
         source: 'kb',
-        description: '见智主台知识库与自定义工具',
+        description: '荐智主台知识库与自定义工具',
         tools: mainPlatformTools.map(t => ({ name: t.name, description: t.description })),
       });
     }
@@ -692,7 +692,7 @@ docker compose down
     for (const [serverName, toolNames] of registryServerTools) {
       mcp.push({ serverId: `mcp-${serverName}`, serverName, tools: toolNames });
     }
-    if (kbNames.length) mcp.push({ serverId: KB_TOOL_SERVER_ID, serverName: '见智知识库', tools: kbNames });
+    if (kbNames.length) mcp.push({ serverId: KB_TOOL_SERVER_ID, serverName: '荐智知识库', tools: kbNames });
 
     return { builtin, mcp, skills: skills ?? [] };
   }

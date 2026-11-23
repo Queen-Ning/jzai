@@ -4,8 +4,8 @@ import { AppDialogHost } from "@/components/AppDialog";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "见智·企业AI",
-  description: "开门见智，工作省事",
+  title: "荐智·企业AI",
+  description: "开门荐智，工作省事",
 };
 
 export const viewport: Viewport = {

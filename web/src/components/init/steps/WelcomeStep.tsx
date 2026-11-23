@@ -58,10 +58,10 @@ export default function WelcomeStep({ onNext }: { onNext: () => void }) {
       {/* Header */}
       <div className="text-center mb-8">
         <div className="inline-flex items-center gap-2 mb-4">
-          <img src="/logo.png" alt="见智" className="w-14 h-14 object-contain" />
+          <img src="/logo.png" alt="荐智" className="w-14 h-14 object-contain" />
         </div>
         <h1 className="text-2xl font-bold text-gray-900 mb-2">
-          欢迎使用见智
+          欢迎使用荐智
         </h1>
         <p className="text-sm text-gray-500">
           企业AI门户 — 首次部署需要完成初始化配置

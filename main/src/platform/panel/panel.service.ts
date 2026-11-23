@@ -10,11 +10,11 @@ import { WorkspaceService } from '../../workspace/workspace.service';
 import * as fs from 'fs';
 
 const SEED_PANELS = [
-  { id: 'cw',            name: 'AI员工',    icon: 'img:/icons/coworker.svg',    permission: 'cw:view',        isBuiltin: false, sortOrder: 2, category: 'builtin', agentId: null },
-  { id: 'dashboard',     name: '数据仪表',  icon: 'img:/icons/dashboard.svg',   permission: 'nav:dashboard',  isBuiltin: false, sortOrder: 3, category: 'builtin', agentId: 'data_master' },
-  { id: 'skills',        name: '技能',      icon: 'img:/icons/skills.svg',      permission: 'nav:skills',     isBuiltin: false, sortOrder: 5, category: 'builtin', agentId: 'skill_master' },
-  { id: 'connectors',    name: '连接',      icon: 'img:/icons/connectors.svg',  permission: 'nav:connectors', isBuiltin: false, sortOrder: 6, category: 'builtin', agentId: 'connector_master' },
-  { id: 'agents',        name: '智能体',    icon: 'img:/icons/agents.svg',      permission: 'nav:agents',     isBuiltin: false, sortOrder: 7, category: 'system',  agentId: null },
+  { id: 'dashboard',     name: '数据仪表',  icon: 'img:/icons/dashboard.svg',   permission: 'nav:dashboard',  isBuiltin: false, sortOrder: 2, category: 'builtin', agentId: 'data_master' },
+  { id: 'connectors',    name: '连接',      icon: 'img:/icons/connectors.svg',  permission: 'nav:connectors', isBuiltin: false, sortOrder: 3, category: 'builtin', agentId: 'connector_master' },
+  { id: 'skills',        name: '技能',      icon: 'img:/icons/skills.svg',      permission: 'nav:skills',     isBuiltin: false, sortOrder: 4, category: 'builtin', agentId: 'skill_master' },
+  { id: 'agents',        name: '智能体',    icon: 'img:/icons/agents.svg',      permission: 'nav:agents',     isBuiltin: false, sortOrder: 5, category: 'system',  agentId: null },
+  { id: 'cw',            name: 'AI员工',    icon: 'img:/icons/coworker.svg',    permission: 'cw:view',        isBuiltin: false, sortOrder: 6, category: 'builtin', agentId: null },
   { id: 'apps',          name: '应用',      icon: 'img:/icons/apps.svg',        permission: 'nav:apps',       isBuiltin: false, sortOrder: 8, category: 'builtin', agentId: null },
   { id: 'cfg',           name: '设置',      icon: '⚙',                          permission: 'nav:settings',   isBuiltin: true,  sortOrder: 9, category: 'system',  agentId: null },
 ];
@@ -151,7 +151,7 @@ export class PanelService implements OnModuleInit {
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (id) DO UPDATE SET
            name = $2, icon = $3, permission = $4,
-           category = $7, agent_id = $8`,
+           sort_order = $6, category = $7, agent_id = $8`,
         [p.id, p.name, p.icon, p.permission, p.isBuiltin, p.sortOrder, p.category, p.agentId],
       );
     }
