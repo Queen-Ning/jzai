@@ -118,6 +118,10 @@ export function useChat(conversationId: string, token?: string | null, agentId: 
       setSessionId(null);
     }
   }, [conversationId]);
+  // 跨 agent 会话暂存：agent 随面板联动切换时记住各自切走时的会话指针，切回时原样恢复
+  // （只存 sessionId 不存消息——恢复时按 id 重新拉取，避免与进行中 run 的 attach 续流冲突）
+  const sessionStashRef = useRef(new Map<string, { sessionId: string | null; forceNew: boolean }>());
+  const prevAgentRef = useRef(agentId);
   const tokenRef = useRef(token);
   const lastActivityRef = useRef(0);  // timestamp of last stream/tool/debug event
   const inactivityTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -162,8 +166,45 @@ export function useChat(conversationId: string, token?: string | null, agentId: 
     setIsStreaming(false);
   }, []);
 
+  /** Load a historical session's messages */
+  const loadSession = useCallback(async (sid: string) => {
+    setSessionId(sid);
+    // 先重置流式瞬态：旧会话的 done/thinking 已被 sessionId 过滤丢弃，不清会永久卡住
+    resetStreamUi();
+    try {
+      const tkn = typeof window !== 'undefined' ? localStorage.getItem('jz_token') : null;
+      const headers: Record<string, string> = {};
+      if (tkn) headers['Authorization'] = `Bearer ${tkn}`;
+      const resp = await fetch(`${MAIN_URL}/api/sessions/${sid}/messages`, { headers });
+      const data = await resp.json();
+      const msgs = Array.isArray(data) ? data : (data.messages || data.data || []);
+      const loaded: ChatMessage[] = msgs.map((m: any) => ({
+        id: m.id,
+        role: m.role as 'user' | 'assistant' | 'system',
+        content: m.content,
+        timestamp: new Date(m.createdAt),
+        model: m.role === 'assistant' ? (m.metadata?.model || 'history') : undefined,
+        // 历史恢复时还原工具调用（含面板消息 _panel_output，供图纸预览等面板数据重建）
+        toolCalls: m.metadata?.toolCalls,
+      }));
+      setMessages(loaded);
+    } catch {}
+    // 历史加载完再 attach：若该会话有进行中的 run，快照续流（避免历史覆盖快照）
+    attachSession(sid);
+  }, [attachSession, resetStreamUi]);
+
   // Clear state and load latest session when agent/conversation changes
   useEffect(() => {
+    const switched = prevAgentRef.current !== agentId;
+    if (switched) {
+      // 切走：暂存旧 agent 的会话指针
+      sessionStashRef.current.set(prevAgentRef.current, { sessionId: sessionIdRef.current, forceNew: forceNewRef.current });
+      prevAgentRef.current = agentId;
+    }
+    // 切回：有暂存则恢复原会话（含"新建未发消息"的空会话状态），不走"最新会话"自动加载
+    const stashed = switched ? sessionStashRef.current.get(agentId) : undefined;
+    if (stashed) sessionStashRef.current.delete(agentId);
+
     setMessages([]);
     setDebugEvents([]);
     setSessionId(null);
@@ -177,6 +218,12 @@ export function useChat(conversationId: string, token?: string | null, agentId: 
     thinkingHeadRef.current = '';
     setThinkingText('');
     setThinkingHead('');
+
+    if (stashed) {
+      forceNewRef.current = stashed.forceNew;
+      if (stashed.sessionId) loadSession(stashed.sessionId);
+      return;
+    }
 
     // Auto-load the most recent session for non-main agents
     if (token && agentId && agentId !== 'main') {
@@ -212,7 +259,7 @@ export function useChat(conversationId: string, token?: string | null, agentId: 
       // main agent 不自动加载历史，但可能有进行中的 run（如生成中刷新页面）——按 agentId 探测恢复
       attachSession(undefined);
     }
-  }, [agentId, token, attachSession]);
+  }, [agentId, token, attachSession, loadSession]);
 
   // 兜底无活动看门狗：sendMessage 与 attach 恢复进行中 run 时共用。
   // 后端有自己的 180s 无活动看门狗(会 abort 并发 chat.error)，且回合存活期每 45s 发心跳，
@@ -669,43 +716,17 @@ export function useChat(conversationId: string, token?: string | null, agentId: 
     armInactivityWatch();
   }, [conversationId, socket, pendingAttachments, agentId, sessionId, armInactivityWatch]);
 
-  /** Load a historical session's messages */
-  const loadSession = useCallback(async (sid: string) => {
-    setSessionId(sid);
-    // 先重置流式瞬态：旧会话的 done/thinking 已被 sessionId 过滤丢弃，不清会永久卡住
-    resetStreamUi();
-    try {
-      const tkn = typeof window !== 'undefined' ? localStorage.getItem('jz_token') : null;
-      const headers: Record<string, string> = {};
-      if (tkn) headers['Authorization'] = `Bearer ${tkn}`;
-      const resp = await fetch(`${MAIN_URL}/api/sessions/${sid}/messages`, { headers });
-      const data = await resp.json();
-      const msgs = Array.isArray(data) ? data : (data.messages || data.data || []);
-      const loaded: ChatMessage[] = msgs.map((m: any) => ({
-        id: m.id,
-        role: m.role as 'user' | 'assistant' | 'system',
-        content: m.content,
-        timestamp: new Date(m.createdAt),
-        model: m.role === 'assistant' ? (m.metadata?.model || 'history') : undefined,
-        // 历史恢复时还原工具调用（含面板消息 _panel_output，供图纸预览等面板数据重建）
-        toolCalls: m.metadata?.toolCalls,
-      }));
-      setMessages(loaded);
-    } catch {}
-    // 历史加载完再 attach：若该会话有进行中的 run，快照续流（避免历史覆盖快照）
-    attachSession(sid);
-  }, [attachSession, resetStreamUi]);
-
   /** Start a new session (clear messages, reset sessionId) */
   const newSession = useCallback(() => {
     sessionEpochRef.current++;
+    sessionStashRef.current.delete(agentId);  // 显式新建：清掉本 agent 暂存，切走再切回不得复活旧会话
     setSessionId(null);
     setMessages([]);
     setDebugEvents([]);
     setContextStatus(null);
     resetStreamUi();  // 旧 run 残余事件由 handler 的 assistantIdRef 防御拦截
     forceNewRef.current = true;  // 下一条消息带 forceNewSession，后端强制开新会话（不复用最近会话）
-  }, [resetStreamUi]);
+  }, [resetStreamUi, agentId]);
 
   /** Reply to a pending tool parameter confirmation */
   const confirmReply = useCallback((confirmed: boolean, editedArgs?: Record<string, any>) => {

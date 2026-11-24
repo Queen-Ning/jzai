@@ -279,21 +279,21 @@ export class AppStoreController {
 
   @Get('apps/:appId/grants')
   async getGrants(@Param('appId') appId: string, @Req() req: any) {
-    this.requireAdmin(req);
+    this.requireAppPerms(req);
     return this.grants.getGrants(appId);
   }
 
   /** MC12（T-P-20）：按权限项汇总已授权的用户、角色、部门（设置「应用权限」页） */
   @Get('apps/:appId/grants/summary')
   async getGrantSummary(@Param('appId') appId: string, @Req() req: any) {
-    this.requireAdmin(req);
+    this.requireAppPerms(req);
     return this.grants.listGrantsByTarget(appId);
   }
 
   /** 写入一条授权（level 为 none 时撤销）；设置「应用权限」页的批量授予逐项调用本接口 */
   @Post('apps/:appId/grants')
   async setGrant(@Param('appId') appId: string, @Body() body: any, @Req() req: any) {
-    this.requireAdmin(req);
+    this.requireAppPerms(req);
     const permissionId = typeof body?.permissionId === 'string' ? body.permissionId : '';
     const targetId = typeof body?.targetId === 'string' ? body.targetId.trim() : '';
     const targetType = body?.targetType as GrantTargetType;
@@ -560,6 +560,14 @@ export class AppStoreController {
   private requireAdmin(req: any): void {
     if (req.user?.role?.permissions?.includes('sys:admin') !== true) {
       throw new ForbiddenException('需要管理员权限');
+    }
+  }
+
+  /** 应用授权管理：sys:admin 或设置分签 cfg:appPerms（应用权限 tab 的后端守卫） */
+  private requireAppPerms(req: any): void {
+    const perms: string[] = req.user?.role?.permissions ?? [];
+    if (!perms.includes('sys:admin') && !perms.includes('cfg:appPerms')) {
+      throw new ForbiddenException('需要应用权限管理授权（cfg:appPerms）');
     }
   }
 

@@ -2,7 +2,7 @@ import { Controller, Get, Delete, Patch, Put, Post, Param, Body, Req, NotFoundEx
 import { ToolRegistryService } from './tool-registry.service';
 import { AppCapabilityService } from '../../platform/app-store/services/app-capability.service';
 import { ResourceAccessService } from '../../platform/authz/resource-access.service';
-import { RequireAdmin } from '../../platform/authz/require-permission.decorator';
+import { RequirePermission } from '../../platform/authz/require-permission.decorator';
 import { createUserPrincipal } from '../../platform/app-store/runtime/invocation-principal';
 import { AppMcpExposeService } from '../../platform/app-store/services/app-mcp-expose.service';
 
@@ -25,11 +25,11 @@ export class ToolRegistryController {
   @Get('deleted')
   listDeleted() { return this.tools.listDeleted(); }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Post('deleted/:dirName/restore')
   restore(@Param('dirName') dirName: string) { return this.tools.restore(dirName); }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Delete('deleted/:dirName')
   purge(@Param('dirName') dirName: string) { return this.tools.purge(dirName); }
 
@@ -95,7 +95,7 @@ export class ToolRegistryController {
     return { error: 'Not found' };
   }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Patch(':name')
   async toggle(@Param('name') name: string, @Body() body: { enabled?: boolean }) {
     if ((await this.appToolNames()).has(name)) {
@@ -106,7 +106,7 @@ export class ToolRegistryController {
     return ok ? { success: true, name, enabled: body.enabled } : { error: 'Not found' };
   }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Delete(':name')
   async deleteTool(@Param('name') name: string) {
     if ((await this.appToolNames()).has(name)) {
@@ -121,39 +121,39 @@ export class ToolRegistryController {
     return manifest !== null ? { manifest } : { error: 'Not found' };
   }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Put(':name/manifest')
   saveManifest(@Param('name') name: string, @Body() body: { manifest: string }) {
     return this.tools.saveManifest(name, body.manifest) ? { success: true } : { error: 'Not found' };
   }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Get(':name/handler')
   getHandler(@Param('name') name: string) {
     const handler = this.tools.getHandler(name);
     return handler !== null ? { handler } : { error: 'Not found' };
   }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Put(':name/handler')
   saveHandler(@Param('name') name: string, @Body() body: { handler: string }) {
     return this.tools.saveHandler(name, body.handler) ? { success: true } : { error: 'Not found' };
   }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Post('reload')
   reload() {
     this.tools.loadAll();
     return { tools: this.tools.getAll().length };
   }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Put(':name/llm-hint')
   setLlmHint(@Param('name') name: string, @Body() body: { llmHint: string }) {
     return this.tools.setLlmHint(name, body.llmHint) ? { success: true } : { error: 'Not found' };
   }
 
-  @RequireAdmin()
+  @RequirePermission('cfg:tools')
   @Put(':name/permissions')
   setPermissions(@Param('name') name: string, @Body() perms: { allowedRoles?: string[]; allowedUsers?: string[] }) {
     return this.tools.setPermissions(name, perms) ? { success: true } : { error: 'Not found' };

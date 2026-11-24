@@ -1,8 +1,8 @@
 /**
- * 见智数据仪表 OEM 嵌入 SDK（W1）
+ * 荐智数据仪表 OEM 嵌入 SDK（W1）
  *
  * 用法（在第三方页面中）：
- *   <script src="https://<见智域名>/oem/sdk.js"></script>
+ *   <script src="https://<荐智域名>/oem/sdk.js"></script>
  *   <script>
  *     JianzhiDashboard.embed('#container', {
  *       token,                       // 必填：宿主后端 /api/oem/token 换来的短时 token
@@ -21,7 +21,7 @@
   'use strict';
   var ENVELOPE = 'jianzhi-oem';
 
-  // 从加载本脚本的 <script src> 推断见智 origin
+  // 从加载本脚本的 <script src> 推断荐智 origin
   function inferOrigin() {
     try {
       var cur = document.currentScript && document.currentScript.src;

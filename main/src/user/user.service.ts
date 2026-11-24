@@ -18,15 +18,31 @@ if (!JWT_SECRET) {
 }
 
 export const ALL_PERMISSIONS = [
-  'chat:use', 'chat:coworker',
-  'kb:read', 'kb:write', 'kb:review',
+  'chat:use',
+  'kb:read', 'kb:write',
   'cw:view', 'cw:manage', 'cw:build',
   'dash:view', 'dash:view_all',
-  'cfg:model', 'cfg:automation', 'cfg:users',
+  // 设置面板分签权限（搭配 nav:settings 入口使用）
+  'cfg:users', 'cfg:model', 'cfg:tools', 'cfg:timer', 'cfg:analytics', 'cfg:oem', 'cfg:appPerms', 'cfg:general',
   // 一级菜单导航权限（可单独授予/收回；存量角色由迁移 051 补齐原可见项，行为不变）
   'nav:skills', 'nav:connectors', 'nav:agents', 'nav:apps', 'nav:dashboard', 'nav:settings',
   'sys:admin',
 ] as const;
+
+/**
+ * 角色编辑器中可授予的权限项（getAllPermissions 返回此集合）。
+ * 不含：chat:use（对话是登录用户的必需权限，创建/更新角色时自动附带，不作为授权项）；
+ * kb:*（知识库已独立为 APP，走应用授权）；dash:*（看板无判定点）；
+ * sys:admin（系统管理员只能由内置 admin 角色持有）。
+ */
+export const EDITABLE_PERMISSIONS = [
+  'cw:view', 'cw:manage', 'cw:build',
+  'nav:dashboard', 'nav:connectors', 'nav:skills', 'nav:agents', 'nav:apps', 'nav:settings',
+  'cfg:users', 'cfg:model', 'cfg:tools', 'cfg:timer', 'cfg:analytics', 'cfg:oem', 'cfg:appPerms', 'cfg:general',
+] as const;
+
+/** 所有角色的必需权限：不作为授权项展示，创建/更新角色时自动附带，保证基础功能可用 */
+const REQUIRED_PERMISSIONS: Permission[] = ['chat:use'];
 
 export type Permission = typeof ALL_PERMISSIONS[number];
 
@@ -40,9 +56,17 @@ export interface UserPublic {
 
 const DEFAULT_ROLES: Role[] = [
   { id: 'admin', name: '管理员', description: '拥有系统全部权限', permissions: [...ALL_PERMISSIONS], isSystem: true },
-  { id: 'user', name: '普通用户', description: '使用对话、查看企业心智、查看个人看板',
-    permissions: ['chat:use', 'chat:coworker', 'kb:read', 'dash:view', 'nav:apps', 'nav:dashboard'], isSystem: true },
+  { id: 'user', name: '普通用户', description: '使用对话、浏览知识库、查看数据仪表与应用',
+    permissions: ['chat:use', 'kb:read', 'dash:view', 'nav:apps', 'nav:dashboard'], isSystem: true },
 ];
+
+/** 内置角色 id：只读，不可修改/删除，新建角色只能以它们为继承基线 */
+const BUILTIN_ROLE_IDS = ['admin', 'user'] as const;
+
+/** 自动附带必需权限（如 chat:use），避免编辑角色时因授权项隐藏而被剔除 */
+function withRequiredPermissions(perms: Permission[]): Permission[] {
+  return Array.from(new Set([...REQUIRED_PERMISSIONS, ...perms]));
+}
 
 @Injectable()
 export class UserService implements OnModuleInit {
@@ -107,18 +131,34 @@ export class UserService implements OnModuleInit {
     return rows[0] ? this.mapRole(rows[0]) : undefined;
   }
 
-  async createRole(name: string, description: string, permissions: Permission[]): Promise<Role> {
+  /**
+   * 新建角色：必须以某个内置角色为继承基线（baseRoleId ∈ {admin, user}），
+   * permissions 可在基线之上自由增删（校验 ⊆ 权限字典）。
+   */
+  async createRole(name: string, description: string, permissions: Permission[], baseRoleId: string): Promise<Role> {
+    if (!(BUILTIN_ROLE_IDS as readonly string[]).includes(baseRoleId)) {
+      throw new Error('新建角色必须选择继承的内置角色（admin 或 user）');
+    }
+    const valid = new Set<string>(ALL_PERMISSIONS);
+    const invalid = permissions.filter(p => !valid.has(p));
+    if (invalid.length > 0) {
+      throw new Error(`未知权限项: ${invalid.join(', ')}`);
+    }
+    const perms = withRequiredPermissions(permissions);
     const id = name.toLowerCase().replace(/\s+/g, '_') + '_' + Date.now().toString(36).slice(-4);
-    await this.db.query('INSERT INTO jz_roles(id,name,description,permissions,is_system) VALUES($1,$2,$3,$4,FALSE)', [id, name, description, permissions]);
-    return { id, name, description, permissions, isSystem: false };
+    await this.db.query('INSERT INTO jz_roles(id,name,description,permissions,is_system) VALUES($1,$2,$3,$4,FALSE)', [id, name, description, perms]);
+    return { id, name, description, permissions: perms, isSystem: false };
   }
 
   async updateRole(id: string, updates: { name?: string; description?: string; permissions?: Permission[] }): Promise<Role | null> {
+    if ((BUILTIN_ROLE_IDS as readonly string[]).includes(id)) {
+      throw new Error('内置角色不可修改');
+    }
     const role = await this.getRole(id);
     if (!role) return null;
     const name = updates.name || role.name;
     const desc = updates.description || role.description;
-    const perms = updates.permissions || role.permissions;
+    const perms = updates.permissions ? withRequiredPermissions(updates.permissions) : role.permissions;
     await this.db.query('UPDATE jz_roles SET name=$2, description=$3, permissions=$4 WHERE id=$1', [id, name, desc, perms]);
     return { ...role, name, description: desc, permissions: perms };
   }
@@ -132,18 +172,16 @@ export class UserService implements OnModuleInit {
     return true;
   }
 
+  /** 角色编辑器可授予的权限项（EDITABLE_PERMISSIONS；chat:use 为必需权限自动附带，不展示） */
   getAllPermissions() {
     const labels: Record<string, string> = {
-      'chat:use': '使用主智能体对话', 'chat:coworker': '与CoWorker对话',
-      'kb:read': '浏览企业心智', 'kb:write': '管理企业心智内容', 'kb:review': '审核知识建议',
-      'cw:view': '查看CoWorker列表', 'cw:manage': '管理CoWorker配置', 'cw:build': '构建CoWorker镜像',
-      'dash:view': '查看个人看板', 'dash:view_all': '查看全员看板',
-      'cfg:model': '管理模型配置', 'cfg:automation': '管理快捷系统', 'cfg:users': '管理用户和角色',
-      'nav:skills': '查看技能入口', 'nav:connectors': '查看连接入口', 'nav:agents': '查看智能体入口',
-      'nav:apps': '查看应用入口', 'nav:dashboard': '查看数据仪表面板', 'nav:settings': '进入设置面板',
-      'sys:admin': '系统管理员',
+      'cw:view': '查看AI员工列表', 'cw:manage': '管理AI员工配置', 'cw:build': '构建AI员工镜像',
+      'nav:dashboard': '查看数据仪表入口', 'nav:connectors': '查看连接入口', 'nav:skills': '查看技能入口',
+      'nav:agents': '查看智能体入口', 'nav:apps': '查看应用入口', 'nav:settings': '进入设置面板',
+      'cfg:users': '用户与组织', 'cfg:model': '模型', 'cfg:tools': '工具管理', 'cfg:timer': '定时任务',
+      'cfg:analytics': '运营分析', 'cfg:oem': '三方扩展', 'cfg:appPerms': '应用权限', 'cfg:general': '系统通用',
     };
-    return ALL_PERMISSIONS.map(p => ({ id: p, module: p.split(':')[0], action: p.split(':')[1], label: labels[p] || p }));
+    return EDITABLE_PERMISSIONS.map(p => ({ id: p, module: p.split(':')[0], action: p.split(':')[1], label: labels[p] || p }));
   }
 
   // ===== Users =====

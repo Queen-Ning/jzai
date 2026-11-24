@@ -121,23 +121,32 @@ export class UserController {
 
   @Audit('create_role', 'role')
   @Post('roles')
-  createRole(@Req() req: any, @Body() body: { name: string; description: string; permissions: Permission[] }) {
+  createRole(@Req() req: any, @Body() body: { name: string; description: string; permissions: Permission[]; baseRoleId: string }) {
     this.requirePermission(req, 'cfg:users');
-    return this.userService.createRole(body.name, body.description, body.permissions);
+    try {
+      return this.userService.createRole(body.name, body.description, body.permissions, body.baseRoleId);
+    } catch (err: any) {
+      throw new ForbiddenException(err.message);
+    }
   }
 
   @Audit('update_role', 'role')
   @Put('roles/:id')
   updateRole(@Req() req: any, @Param('id') id: string, @Body() body: any) {
     this.requirePermission(req, 'cfg:users');
-    return this.userService.updateRole(id, body);
+    try {
+      return this.userService.updateRole(id, body);
+    } catch (err: any) {
+      throw new ForbiddenException(err.message);
+    }
   }
 
   @Audit('delete_role', 'role')
   @Delete('roles/:id')
-  deleteRole(@Req() req: any, @Param('id') id: string) {
+  async deleteRole(@Req() req: any, @Param('id') id: string) {
     this.requirePermission(req, 'cfg:users');
-    const deleted = this.userService.deleteRole(id);
+    // 必须 await：直接对 Promise 判空恒为 false，会导致引用检查被跳过、删除静默失败
+    const deleted = await this.userService.deleteRole(id);
     if (!deleted) throw new ForbiddenException('无法删除系统角色或正在使用的角色');
     return { deleted };
   }
