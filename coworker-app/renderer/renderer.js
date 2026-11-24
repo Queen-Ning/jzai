@@ -65,6 +65,8 @@ let wechatBindEntry;
 let mainUrlInput, tokenInput, workDirInput, selectWorkDirBtn, activateBtn, errorMessage, loading;
 let statusDot, statusText, logPanel, logContent, logToggle, logClear, logClose;
 let wechatLoginCard, wechatLoginBtn, wechatCancelBtn, wechatOutput, wechatQrCode;
+let dingtalkBindEntry, dingtalkLoginCard, dingtalkCancelBtn, dingtalkStatus;
+let dingtalkManualToggle, dingtalkManualForm, dingtalkClientIdInput, dingtalkClientSecretInput, dingtalkSaveManualBtn;
 
 // 全局错误捕获
 window.addEventListener('error', (event) => {
@@ -129,6 +131,17 @@ function initDOMElements() {
   wechatCancelBtn = document.getElementById('wechatCancelBtn');
   wechatOutput = document.getElementById('wechatOutput');
   wechatQrCode = document.getElementById('wechatQrCode');
+
+  // 钉钉绑定相关元素
+  dingtalkBindEntry = document.getElementById('dingtalkBindEntry');
+  dingtalkLoginCard = document.getElementById('dingtalkLoginCard');
+  dingtalkCancelBtn = document.getElementById('dingtalkCancelBtn');
+  dingtalkStatus = document.getElementById('dingtalkStatus');
+  dingtalkManualToggle = document.getElementById('dingtalkManualToggle');
+  dingtalkManualForm = document.getElementById('dingtalkManualForm');
+  dingtalkClientIdInput = document.getElementById('dingtalkClientId');
+  dingtalkClientSecretInput = document.getElementById('dingtalkClientSecret');
+  dingtalkSaveManualBtn = document.getElementById('dingtalkSaveManualBtn');
 
   console.log('[RENDERER] DOM元素初始化完成');
   rendererPerf.mark('dom-init-complete');
@@ -423,6 +436,81 @@ function setupEventListeners() {
         }
         if (wechatLoginBtn) wechatLoginBtn.disabled = false;
         if (wechatCancelBtn) wechatCancelBtn.disabled = false;
+      }
+    });
+  }
+
+  // 手动绑定钉钉入口
+  if (dingtalkBindEntry) {
+    dingtalkBindEntry.addEventListener('click', async () => {
+      addLog('手动发起钉钉绑定', 'info');
+      showDingtalkLogin();
+      renderDingtalkQrLoading();
+      setDingtalkStatus('正在向钉钉申请授权二维码…');
+      try {
+        const result = await ipcRenderer.invoke('dingtalk-login');
+        if (!result || !result.success) {
+          const reason = result?.error || '未知错误';
+          addLog(`钉钉授权启动失败: ${reason}`, 'error');
+          setDingtalkStatus(`启动失败：${reason}`);
+        }
+      } catch (error) {
+        addLog(`钉钉授权启动异常: ${error.message}`, 'error');
+        setDingtalkStatus(`启动异常：${error.message}`);
+      }
+    });
+  }
+
+  // 取消钉钉绑定
+  if (dingtalkCancelBtn) {
+    dingtalkCancelBtn.addEventListener('click', async () => {
+      addLog('取消钉钉绑定', 'info');
+      await ipcRenderer.invoke('dingtalk-login-cancel');
+      hideDingtalkLogin();
+      await showGateway();
+    });
+  }
+
+  // 展开/折叠手动填写
+  if (dingtalkManualToggle) {
+    dingtalkManualToggle.addEventListener('click', (event) => {
+      event.preventDefault();
+      if (!dingtalkManualForm) return;
+      dingtalkManualForm.style.display = dingtalkManualForm.style.display === 'none' ? 'block' : 'none';
+    });
+  }
+
+  // 手动保存钉钉凭证
+  if (dingtalkSaveManualBtn) {
+    dingtalkSaveManualBtn.addEventListener('click', async () => {
+      const clientId = dingtalkClientIdInput ? dingtalkClientIdInput.value.trim() : '';
+      const clientSecret = dingtalkClientSecretInput ? dingtalkClientSecretInput.value.trim() : '';
+      if (!clientId || !clientSecret) {
+        setDingtalkStatus('请填写 Client ID 和 Client Secret');
+        return;
+      }
+
+      dingtalkSaveManualBtn.disabled = true;
+      setDingtalkStatus('正在保存到平台…');
+      try {
+        const result = await ipcRenderer.invoke('dingtalk-save-manual', { clientId, clientSecret });
+        if (result && result.success) {
+          addLog('钉钉机器人配置已保存', 'success');
+          setDingtalkStatus('保存成功，正在重启运行时…');
+          setTimeout(async () => {
+            hideDingtalkLogin();
+            await showGateway();
+          }, 1200);
+        } else {
+          const reason = result?.error || '未知错误';
+          addLog(`钉钉配置保存失败: ${reason}`, 'error');
+          setDingtalkStatus(`保存失败：${reason}`);
+        }
+      } catch (error) {
+        addLog(`钉钉配置保存异常: ${error.message}`, 'error');
+        setDingtalkStatus(`保存异常：${error.message}`);
+      } finally {
+        dingtalkSaveManualBtn.disabled = false;
       }
     });
   }
@@ -822,6 +910,66 @@ ipcRenderer.on('wechat-login-timeout', (event) => {
   wechatLoginBtn.disabled = false;
 });
 
+// ===== 钉钉绑定处理 =====
+
+function setDingtalkStatus(text) {
+  if (dingtalkStatus) dingtalkStatus.textContent = text;
+}
+
+function renderDingtalkQrLoading() {
+  const wrapper = document.getElementById('dingtalkQrCodeWrapper');
+  if (wrapper) {
+    wrapper.innerHTML = '<div class="wechat-qrcode-loading">正在生成二维码...</div>';
+  }
+}
+
+function renderDingtalkQrCode(url) {
+  const wrapper = document.getElementById('dingtalkQrCodeWrapper');
+  if (!wrapper) return;
+
+  wrapper.innerHTML = '';
+
+  const container = document.createElement('div');
+  container.className = 'wechat-qrcode-container';
+
+  const qrImg = document.createElement('img');
+  qrImg.className = 'wechat-qrcode-image';
+  qrImg.alt = '钉钉授权二维码';
+  qrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(url)}`;
+
+  const qrHint = document.createElement('div');
+  qrHint.className = 'wechat-qrcode-hint';
+  qrHint.textContent = '请使用钉钉扫描上方二维码完成授权';
+
+  container.appendChild(qrImg);
+  container.appendChild(qrHint);
+  wrapper.appendChild(container);
+}
+
+// 二维码地址（原样编码，别自己拼参数）
+ipcRenderer.on('dingtalk-login-qrcode', (event, { url }) => {
+  console.log('[RENDERER] 收到钉钉授权二维码');
+  renderDingtalkQrCode(url);
+  setDingtalkStatus('等待钉钉扫码确认…');
+});
+
+// 平台已保存配置 + gateway 重启中
+ipcRenderer.on('dingtalk-login-success', (event, { version } = {}) => {
+  addLog('钉钉机器人绑定成功', 'success');
+  setDingtalkStatus(version ? `授权成功（配置版本 v${version}），正在重启运行时…` : '授权成功，正在重启运行时…');
+
+  setTimeout(async () => {
+    hideDingtalkLogin();
+    await showGateway();
+  }, 2000);
+});
+
+ipcRenderer.on('dingtalk-login-error', (event, { error } = {}) => {
+  const reason = error || '未知错误';
+  addLog(`钉钉绑定失败: ${reason}`, 'error');
+  setDingtalkStatus(`失败：${reason}`);
+});
+
 // ===== UI 更新 =====
 
 function hideAllCards() {
@@ -829,6 +977,7 @@ function hideAllCards() {
   if (diagnosticCard) diagnosticCard.style.display = 'none';
   if (activationCard) activationCard.style.display = 'none';
   if (wechatLoginCard) wechatLoginCard.style.display = 'none';
+  if (dingtalkLoginCard) dingtalkLoginCard.style.display = 'none';
   webviewContainer.classList.remove('show');
   stopBootTicker();
 }
@@ -907,6 +1056,21 @@ function hideWeChatLogin() {
   }
 }
 
+function showDingtalkLogin() {
+  hideAllCards();
+  if (dingtalkLoginCard) {
+    dingtalkLoginCard.style.display = 'block';
+  }
+  updateStatus('connecting');
+  addLog('请使用钉钉扫码完成机器人授权', 'info');
+}
+
+function hideDingtalkLogin() {
+  if (dingtalkLoginCard) {
+    dingtalkLoginCard.style.display = 'none';
+  }
+}
+
 // 全局重试状态跟踪
 let gatewayRetryCount = 0;
 const MAX_GATEWAY_RETRIES = 30;
@@ -927,6 +1091,11 @@ async function showGateway(options = { delay: 0 }) {
   if (wechatBindEntry) {
     const bound = !!(initState.onboarding && initState.onboarding.completed);
     wechatBindEntry.style.display = bound ? 'none' : 'flex';
+  }
+
+  // 钉钉入口常驻：目前平台未下发绑定状态，先保证随时可绑/可重绑
+  if (dingtalkBindEntry) {
+    dingtalkBindEntry.style.display = 'flex';
   }
 
   // 重新获取 webview 元素引用

@@ -32,6 +32,45 @@ import { WorkflowTransactionService, CreateWorkflowOptions, WorkflowStep } from 
 import { GatewayHealthService } from './gateway-health.service';
 import type { CrashReport, HealthSnapshot } from './gateway-health.service';
 
+/**
+ * 客户端可回写的通道配置白名单。
+ * config_overrides 是 deepMerge 的最高优先级层（coworker-config.service.ts:209），
+ * 放开任意键等于让客户端 token 接管 models / mcp / tools.allow / plugins，
+ * 因此这里只放行通道自身字段，且逐个限定类型与范围。
+ */
+const CHANNEL_OVERRIDE_SPEC: Record<string, {
+  fields: Record<string, (v: any) => string | null>;
+}> = {
+  'dingtalk-connector': {
+    fields: {
+      enabled: v => (typeof v === 'boolean' ? null : 'must be boolean'),
+      clientId: v => (typeof v === 'string' && v.length >= 8 && v.length <= 128 ? null : 'must be string[8..128]'),
+      clientSecret: v => (typeof v === 'string' && v.length >= 8 && v.length <= 256 ? null : 'must be string[8..256]'),
+      requireMention: v => (typeof v === 'boolean' ? null : 'must be boolean'),
+      dmPolicy: v => (v === 'open' || v === 'closed' ? null : "must be 'open' | 'closed'"),
+      groupPolicy: v => (v === 'open' || v === 'mention' ? null : "must be 'open' | 'mention'"),
+      groupReplyMode: v => (v === 'markdown' || v === 'text' ? null : "must be 'markdown' | 'text'"),
+      allowFrom: v => (
+        Array.isArray(v)
+        && v.length <= 50
+        && v.every(i => typeof i === 'string' && i.length <= 64)
+          ? null
+          : 'must be string[] (<=50 items, each <=64 chars)'
+      ),
+    },
+  },
+};
+
+/** 原型污染防护：任意层级出现这些键一律拒绝。 */
+const FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function hasForbiddenKey(value: any, depth = 0): boolean {
+  if (!value || typeof value !== 'object' || depth > 8) return false;
+  return Object.keys(value).some(
+    k => FORBIDDEN_KEYS.has(k) || hasForbiddenKey(value[k], depth + 1),
+  );
+}
+
 @Controller('api')
 export class CoWorkerController {
   private readonly logger = new Logger(CoWorkerController.name);
@@ -735,6 +774,76 @@ export class CoWorkerController {
       configVersion: mine.configVersion,
       yaml: this.cwConfig.generateConfig(mine.coworker, mainUrl),
     };
+  }
+
+  // ===== Client-owned channel config (called by OpenClaw instances) =====
+
+  /**
+   * CoWorker 客户端用自己激活时下发的 jw_ 密钥回写通道配置。
+   *
+   * 背景：本地 channels.dingtalk-connector 是钉钉插件写进 openclaw.json 的，
+   * 而 cw.config.update 的落地是整份覆盖（客户端只保留 workspace/gateway.auth/meta），
+   * 下一次推送就会把本地凭据冲掉。所以客户端必须把凭据回写到 config_overrides，
+   * 让平台生成配置时带上它。
+   *
+   * 安全约束：
+   * - 强制 jw_：guard 还有「用户 JWT」和「enroll token」两条 fallback，
+   *   前者会落到该用户第一条 active 分配（多分配用户写错人），后者是低权凭证。
+   * - coworkerId 只认 guard 从 api_key 行解析出的 req.user.coworkerId。
+   * - 通道名与字段全部白名单，越界直接 400，不静默丢弃。
+   */
+  @Public()
+  @UseGuards(CoWorkerAuthGuard)
+  @Put('cw/config/channel/:channelId')
+  async updateOwnChannelConfig(
+    @Req() req: any,
+    @Param('channelId') channelId: string,
+    @Body() body: any,
+  ) {
+    // 与 guard 的取 token 顺序一致，但只接受单值字符串头：
+    // 重复头会变成数组，直接 String() 反而可能构造出看似合法的值。
+    const authHeader = req.headers?.authorization;
+    const apiKeyHeader = req.headers?.['x-api-key'];
+    const queryKey = req.query?.api_key;
+    const rawKey = (typeof authHeader === 'string' && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '')
+      || (typeof apiKeyHeader === 'string' ? apiKeyHeader : '')
+      || (typeof queryKey === 'string' ? queryKey : '');
+    if (!rawKey.startsWith('jw_')) {
+      throw new ForbiddenException('该接口仅接受 AI 员工的 jw_ 密钥');
+    }
+
+    const coworkerId = req.user?.coworkerId;
+    if (!coworkerId) throw new ForbiddenException('缺少 AI 员工身份');
+
+    const spec = CHANNEL_OVERRIDE_SPEC[channelId];
+    if (!spec) throw new BadRequestException(`不支持的通道: ${channelId}`);
+
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new BadRequestException('请求体必须是对象');
+    }
+    if (hasForbiddenKey(body)) {
+      throw new BadRequestException('请求体包含非法键名');
+    }
+
+    const keys = Object.keys(body);
+    if (keys.length === 0) throw new BadRequestException('请求体为空');
+
+    const patch: Record<string, any> = {};
+    for (const key of keys) {
+      const validate = spec.fields[key];
+      if (!validate) throw new BadRequestException(`不支持的字段: ${key}`);
+      const err = validate(body[key]);
+      if (err) throw new BadRequestException(`字段 ${key} 非法: ${err}`);
+      patch[key] = body[key];
+    }
+
+    const version = await this.cwService.updateChannelOverride(coworkerId, channelId, patch);
+    if (!version) throw new NotFoundException('AI 员工不存在');
+
+    await this.cwGateway.pushConfigUpdate(coworkerId, version);
+    this.logger.log(`[ChannelConfig] ${coworkerId} 回写 ${channelId} (${keys.join(',')}) v${version}`);
+
+    return { ok: true, channelId, version };
   }
 
   // ===== LLM Proxy (called by OpenClaw instances) =====

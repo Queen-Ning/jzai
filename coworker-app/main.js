@@ -1608,6 +1608,296 @@ ipcMain.handle('wechat-login-cancel', async () => {
   return { success: true };
 });
 
+// ===== 钉钉扫码绑定 =====
+// 走钉钉设备授权（扫码建机器人）的三个无鉴权接口，流程与 dingtalk-connector 插件一致，
+// 但这里不 import 插件代码：不依赖插件是否加载、也不关心它的终端二维码实现。
+const DINGTALK_REGISTRATION_BASE_URL =
+  process.env.DINGTALK_REGISTRATION_BASE_URL || 'https://oapi.dingtalk.com';
+const DINGTALK_REGISTRATION_SOURCE =
+  process.env.DINGTALK_REGISTRATION_SOURCE || 'DING_DWS_CLAW';
+// 钉钉默认给 7200s，界面挂着没意义，客户端压到 5 分钟
+const DINGTALK_LOGIN_MAX_SECONDS = 300;
+
+// 同一时刻只允许一个扫码会话
+let dingtalkLoginSession = null;
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function sendToRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents) {
+    mainWindow.webContents.send(channel, payload);
+  }
+}
+
+/** 钉钉 OAPI 统一响应判定：errcode 必须为 0 */
+function assertDingtalkOk(data, action) {
+  if (!data || data.errcode !== 0) {
+    const errmsg = (data && data.errmsg) || 'unknown error';
+    const errcode = data && data.errcode !== undefined ? data.errcode : 'N/A';
+    throw new Error(`[${action}] ${errmsg} (errcode=${errcode})`);
+  }
+  return data;
+}
+
+async function dingtalkRegistrationPost(pathname, body, signal) {
+  const axios = require('axios');
+  const response = await axios.post(`${DINGTALK_REGISTRATION_BASE_URL}${pathname}`, body, {
+    timeout: 15000,
+    signal,
+    headers: { 'Content-Type': 'application/json' },
+  });
+  return response.data;
+}
+
+/**
+ * 把钉钉通道配置写到平台（唯一真源）。
+ * 故意不写本地 openclaw.json：那份会被 jianzhi-bridge 的配置热更新整份覆盖。
+ */
+async function putDingtalkChannelConfig(body) {
+  const axios = require('axios');
+  const persisted = readPersistentToken();
+
+  if (!persisted || !persisted.token) {
+    throw new Error('未找到 CoWorker 凭据，请重新激活客户端');
+  }
+  if (isLegacyJwtToken(persisted.token)) {
+    throw new Error('本地凭据已失效，请重新激活客户端');
+  }
+
+  const mainUrl = String(persisted.mainUrl || '').replace(/\/+$/, '');
+  if (!mainUrl) {
+    throw new Error('未找到服务器地址，请重新激活客户端');
+  }
+
+  const url = `${mainUrl}/api/cw/config/channel/dingtalk-connector`;
+  try {
+    const response = await axios.put(url, body, {
+      timeout: 15000,
+      headers: {
+        Authorization: `Bearer ${persisted.token}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    return response.data || {};
+  } catch (error) {
+    const apiMessage = error.response && error.response.data && error.response.data.message;
+    throw new Error(apiMessage || error.message || '保存钉钉通道配置失败');
+  }
+}
+
+/** init → begin → 推送二维码，轮询在后台继续 */
+async function startDingtalkLogin() {
+  if (dingtalkLoginSession) {
+    throw new Error('已有钉钉授权流程进行中，请先取消');
+  }
+
+  const controller = new AbortController();
+  const session = { cancelled: false, controller };
+  dingtalkLoginSession = session;
+
+  try {
+    const initData = assertDingtalkOk(
+      await dingtalkRegistrationPost(
+        '/app/registration/init',
+        { source: DINGTALK_REGISTRATION_SOURCE },
+        controller.signal,
+      ),
+      'init',
+    );
+    const nonce = String(initData.nonce || '').trim();
+    if (!nonce) throw new Error('[init] missing nonce');
+
+    const beginData = assertDingtalkOk(
+      await dingtalkRegistrationPost('/app/registration/begin', { nonce }, controller.signal),
+      'begin',
+    );
+    const deviceCode = String(beginData.device_code || '').trim();
+    const verificationUriComplete = String(beginData.verification_uri_complete || '').trim();
+    if (!deviceCode) throw new Error('[begin] missing device_code');
+    if (!verificationUriComplete) throw new Error('[begin] missing verification_uri_complete');
+
+    const intervalSeconds = Number(beginData.interval) > 0 ? Number(beginData.interval) : 3;
+    const expiresInSeconds = Number(beginData.expires_in) > 0 ? Number(beginData.expires_in) : 7200;
+    const timeoutSeconds = Math.min(expiresInSeconds, DINGTALK_LOGIN_MAX_SECONDS);
+
+    console.log(
+      `[DingTalk Login] 二维码已生成 interval=${intervalSeconds}s timeout=${timeoutSeconds}s`,
+    );
+    sendToRenderer('dingtalk-login-qrcode', { url: verificationUriComplete });
+
+    // 后台轮询，不阻塞 invoke 返回（用户可能扫很久）
+    pollDingtalkUntilDone(session, deviceCode, intervalSeconds, timeoutSeconds).catch(() => {});
+
+    return { qrUrl: verificationUriComplete };
+  } catch (error) {
+    if (dingtalkLoginSession === session) dingtalkLoginSession = null;
+    throw error;
+  }
+}
+
+async function pollDingtalkUntilDone(session, deviceCode, intervalSeconds, timeoutSeconds) {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  const intervalMs = Math.max(1, intervalSeconds) * 1000;
+  let consecutiveErrors = 0;
+
+  try {
+    while (!session.cancelled && Date.now() < deadline) {
+      await delay(intervalMs);
+      if (session.cancelled) return;
+
+      let pollData;
+      try {
+        pollData = assertDingtalkOk(
+          await dingtalkRegistrationPost(
+            '/app/registration/poll',
+            { device_code: deviceCode },
+            session.controller.signal,
+          ),
+          'poll',
+        );
+        consecutiveErrors = 0;
+      } catch (error) {
+        if (session.cancelled) return;
+        consecutiveErrors += 1;
+        console.warn(`[DingTalk Login] poll 失败(${consecutiveErrors}/3):`, error.message);
+        if (consecutiveErrors >= 3) {
+          sendToRenderer('dingtalk-login-error', {
+            error: `轮询授权状态失败：${error.message}`,
+          });
+          return;
+        }
+        continue;
+      }
+
+      const status = String(pollData.status || '').trim().toUpperCase();
+
+      if (!status || status === 'WAITING') continue;
+
+      if (status === 'SUCCESS') {
+        const clientId = String(pollData.client_id || '').trim();
+        const clientSecret = String(pollData.client_secret || '').trim();
+        if (!clientId || !clientSecret) {
+          sendToRenderer('dingtalk-login-error', {
+            error: '授权成功但未返回应用凭证，请重新绑定',
+          });
+          return;
+        }
+        await completeDingtalkBinding({ clientId, clientSecret });
+        return;
+      }
+
+      // FAIL / EXPIRED / 其它：立即失败，不进重试窗口
+      const reason = String(pollData.fail_reason || '').trim();
+      const message = status === 'EXPIRED'
+        ? '授权二维码已过期，请重新生成'
+        : status === 'FAIL'
+          ? (reason || '授权失败，请在钉钉中确认后重试')
+          : (reason || `未知的授权状态：${status}`);
+      sendToRenderer('dingtalk-login-error', { error: message });
+      return;
+    }
+
+    if (!session.cancelled) {
+      sendToRenderer('dingtalk-login-error', { error: '授权超时，请重新发起绑定' });
+    }
+  } catch (error) {
+    if (!session.cancelled) {
+      console.error('[DingTalk Login] 轮询异常:', error.message);
+      sendToRenderer('dingtalk-login-error', { error: error.message });
+    }
+  } finally {
+    if (dingtalkLoginSession === session) dingtalkLoginSession = null;
+  }
+}
+
+/** 扫码成功后：先落平台，成功才通知界面并重启 gateway */
+async function completeDingtalkBinding({ clientId, clientSecret }) {
+  try {
+    const result = await putDingtalkChannelConfig({
+      enabled: true,
+      clientId,
+      clientSecret,
+      requireMention: true,
+      groupReplyMode: 'markdown',
+    });
+    console.log('[DingTalk Login] 平台已保存钉钉通道配置 version=', result.version);
+    sendToRenderer('dingtalk-login-success', { version: result.version || null });
+    try {
+      await restartGatewayInternal();
+    } catch (restartError) {
+      console.error('[DingTalk Login] Gateway 重启失败:', restartError.message);
+    }
+  } catch (error) {
+    console.error('[DingTalk Login] 平台保存失败:', error.message);
+    sendToRenderer('dingtalk-login-error', { error: error.message });
+  }
+}
+
+ipcMain.handle('dingtalk-login', async () => {
+  try {
+    const result = await startDingtalkLogin();
+    return { success: true, qrUrl: result.qrUrl };
+  } catch (error) {
+    console.error('[DingTalk Login] 启动失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+/** 终止当前扫码会话（取消 / 转手动填写时复用） */
+function cancelDingtalkSession() {
+  const session = dingtalkLoginSession;
+  dingtalkLoginSession = null;
+  if (!session) return false;
+
+  session.cancelled = true;
+  try { session.controller.abort(); } catch { /* 忽略 */ }
+  return true;
+}
+
+ipcMain.handle('dingtalk-login-cancel', async () => {
+  if (!cancelDingtalkSession()) return { success: true };
+  console.log('[DingTalk Login] 用户取消授权');
+  return { success: true };
+});
+
+// 手动填 AppKey/AppSecret 的兜底路径
+ipcMain.handle('dingtalk-save-manual', async (event, { clientId, clientSecret } = {}) => {
+  const id = String(clientId || '').trim();
+  const secret = String(clientSecret || '').trim();
+  if (!id || !secret) {
+    return { success: false, error: '请填写 Client ID 和 Client Secret' };
+  }
+
+  // 手填优先：停掉还在跑的扫码会话，避免它稍后把结果覆盖回来
+  cancelDingtalkSession();
+
+  try {
+    const result = await putDingtalkChannelConfig({
+      enabled: true,
+      clientId: id,
+      clientSecret: secret,
+      requireMention: true,
+      groupReplyMode: 'markdown',
+    });
+    await restartGatewayInternal();
+    return { success: true, version: result.version || null };
+  } catch (error) {
+    console.error('[DingTalk] 手动保存失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
+ipcMain.handle('dingtalk-unbind', async () => {
+  try {
+    const result = await putDingtalkChannelConfig({ enabled: false });
+    await restartGatewayInternal();
+    return { success: true, version: result.version || null };
+  } catch (error) {
+    console.error('[DingTalk] 解绑失败:', error.message);
+    return { success: false, error: error.message };
+  }
+});
+
 // IPC: 获取当前 Gateway token（用于 Control UI 自动认证）
 // 返回本次启动生成的 Gateway 认证 token
 ipcMain.handle('get-gateway-token', async () => {
@@ -1630,12 +1920,17 @@ ipcMain.handle('set-wechat-state', async (event, { bound }) => {
   return { success: true };
 });
 
-// IPC: 重启 Gateway（诊断页重试）
-ipcMain.handle('restart-gateway', async () => {
+/** 重启 Gateway（诊断页重试、通道配置变更后复用） */
+async function restartGatewayInternal() {
   console.log('[Gateway] 收到重启请求');
   stopGateway();
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await delay(500);
   startGateway();
+}
+
+// IPC: 重启 Gateway（诊断页重试）
+ipcMain.handle('restart-gateway', async () => {
+  await restartGatewayInternal();
   return { success: true };
 });
 

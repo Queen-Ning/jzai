@@ -178,6 +178,56 @@ export class CoWorkerService {
     return this.getById(id);
   }
 
+  /**
+   * 合并写入某个通道的 overrides（客户端自改通道配置用）。
+   *
+   * 必须走 jsonb 原子合并：update() 是整列覆盖，而客户端只知道自己的
+   * channels 这一段，整份写回会把管理员配置的 plugins.allow / plugins.entries
+   * 一起冲掉。jsonb_set 只在父路径存在时才会创建末级键，所以先补齐 channels
+   * 再写 channels.<channelId>。合并语义是对象浅合并：patch 里出现的键覆盖，
+   * 未出现的保留原值。
+   *
+   * @returns 写入后 jz_coworkers.config_version；coworker 不存在时返回 0
+   */
+  async updateChannelOverride(
+    coworkerId: string,
+    channelId: string,
+    patch: Record<string, any>,
+  ): Promise<number> {
+    const { rows } = await this.db.query(
+      `UPDATE jz_coworkers
+         SET config_overrides = jsonb_set(
+               jsonb_set(
+                 COALESCE(config_overrides, '{}'::jsonb),
+                 '{channels}',
+                 COALESCE(config_overrides->'channels', '{}'::jsonb),
+                 true
+               ),
+               ARRAY['channels', $2::text]::text[],
+               COALESCE(config_overrides->'channels'->$2::text, '{}'::jsonb) || $3::jsonb,
+               true
+             ),
+             updated_at = NOW(),
+             config_version = COALESCE(config_version, 1) + 1
+       WHERE id = $1
+       RETURNING config_version`,
+      [coworkerId, channelId, JSON.stringify(patch)],
+    );
+
+    if (rows.length === 0) return 0;
+
+    // Bump config_version on all assignments for hot-reload
+    await this.db.query(
+      'UPDATE jz_coworker_assignments SET config_version = config_version + 1 WHERE coworker_id = $1',
+      [coworkerId],
+    );
+
+    this.invalidateToolsCache(coworkerId);
+    const configVersion = Number(rows[0].config_version || 0);
+    this.logger.log(`CoWorker ${coworkerId} channel override merged: ${channelId} (config_version=${configVersion})`);
+    return configVersion;
+  }
+
   async delete(id: string): Promise<boolean> {
     const { rowCount } = await this.db.query('DELETE FROM jz_coworkers WHERE id = $1', [id]);
     if (rowCount && rowCount > 0) {
