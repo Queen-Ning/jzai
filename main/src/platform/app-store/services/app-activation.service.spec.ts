@@ -171,4 +171,39 @@ describe('AppActivationService', () => {
       expect.objectContaining({ connections: connectionClient }),
     );
   });
+
+  // T-P-18-C06（启动接线）：activateAll 交给 AppLicenseRuntimeService.shouldActivate 筛选；无该服务时只激活 active
+  it('lets the license runtime decide which apps to activate at startup', async () => {
+    const apps = [
+      { appId: 'a.active', status: 'active', installDir: '', version: '1.0.0', manifest: {} },
+      { appId: 'a.readonly', status: 'license_expired', installDir: '', version: '1.0.0', manifest: {} },
+      { appId: 'a.expired', status: 'license_expired', installDir: '', version: '1.0.0', manifest: {} },
+      { appId: 'a.failed', status: 'failed', installDir: '', version: '1.0.0', manifest: {} },
+    ];
+    const registry = { findAll: jest.fn().mockResolvedValue(apps) };
+    const build = () => new AppActivationService(
+      registry as any, {} as any, {} as any, {} as any, { loadAll: jest.fn() } as any,
+      { getAgentsDir: jest.fn().mockReturnValue(agentsDir), getConfigDir: jest.fn().mockReturnValue(configDir) } as any,
+      { replaceForApp: jest.fn(), removeForApp: jest.fn() } as any,
+      { append: jest.fn(), read: jest.fn().mockReturnValue([]) } as any,
+      { buildFacade: jest.fn().mockReturnValue(undefined) } as any,
+      {} as any,
+    );
+
+    const licenses = { shouldActivate: jest.fn((a: any) => a.appId === 'a.active' || a.appId === 'a.readonly') };
+    (global as any).nestApp = {
+      get: jest.fn((type: { name: string }) => (type.name === 'AppLicenseRuntimeService' ? licenses : undefined)),
+    };
+    const withRuntime = build();
+    const activated = jest.spyOn(withRuntime, 'activateApp').mockResolvedValue(undefined as any);
+    await withRuntime.activateAll();
+    expect(licenses.shouldActivate).toHaveBeenCalledTimes(apps.length);
+    expect(activated.mock.calls.map(c => c[0])).toEqual(['a.active', 'a.readonly']);
+
+    (global as any).nestApp = { get: jest.fn(() => undefined) };
+    const withoutRuntime = build();
+    const fallback = jest.spyOn(withoutRuntime, 'activateApp').mockResolvedValue(undefined as any);
+    await withoutRuntime.activateAll();
+    expect(fallback.mock.calls.map(c => c[0])).toEqual(['a.active']);
+  });
 });

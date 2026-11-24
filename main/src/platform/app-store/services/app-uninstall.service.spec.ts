@@ -4,7 +4,7 @@ import * as path from 'path';
 import { AppUninstallService } from './app-uninstall.service';
 import { AppManifest } from '../validators/manifest.schema';
 
-const appId = 'com.menhu.drawing.dimtuner';
+const appId = 'com.example.drawing.dimtuner';
 const manifest: AppManifest = {
   manifestVersion: '1.0',
   appId,
@@ -56,10 +56,30 @@ describe('AppUninstallService', () => {
     expect(dependencies.registry.updateStatus).toHaveBeenCalledWith(appId, 'uninstalled');
     expect(dependencies.registry.delete).not.toHaveBeenCalled();
   });
+
+  it('removes the emptied versions/ and app root so a same-shortName app can be freshly installed', async () => {
+    const appRoot = path.join(root, 'app-store', 'dim-tuner');
+    const dependencies = createDependencies(root, [], path.join(appRoot, 'versions', '1.0.0'));
+
+    await dependencies.service.uninstall(appId, { purgeData: true });
+
+    expect(fs.existsSync(appRoot)).toBe(false);
+    expect(fs.existsSync(path.join(root, 'app-store'))).toBe(true);
+  });
+
+  it('keeps the app root when it still holds other content', async () => {
+    const appRoot = path.join(root, 'app-store', 'dim-tuner');
+    const dependencies = createDependencies(root, [], path.join(appRoot, 'versions', '1.0.0'));
+    fs.mkdirSync(path.join(appRoot, 'versions', '0.9.0'), { recursive: true });
+
+    await dependencies.service.uninstall(appId, { purgeData: true });
+
+    expect(fs.existsSync(dependencies.installDir)).toBe(false);
+    expect(fs.existsSync(path.join(appRoot, 'versions', '0.9.0'))).toBe(true);
+  });
 });
 
-function createDependencies(root: string, artifactWarnings: string[] = []) {
-  const installDir = path.join(root, 'dim-tuner');
+function createDependencies(root: string, artifactWarnings: string[] = [], installDir = path.join(root, 'dim-tuner')) {
   fs.mkdirSync(installDir, { recursive: true });
   fs.writeFileSync(path.join(installDir, 'app.txt'), 'installed');
 

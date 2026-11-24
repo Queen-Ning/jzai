@@ -48,6 +48,9 @@ export class AppUninstallService {
       // 2.5 Remove capability origin mapping (badges disappear regardless of purge)
       await this.capabilities.removeForApp(appId);
 
+      // 2.6 MC07：删除应用写入的消息与待办投影（应用卸载后快捷动作无处回调）
+      await this.removeInbox(appId);
+
       // 3. Destroy connection pool first (no new queries after this)
       if (this.pools.hasPool(appId)) {
         await this.pools.destroyPool(appId);
@@ -71,6 +74,11 @@ export class AppUninstallService {
       if (record.installDir && fs.existsSync(record.installDir)) {
         fs.rmSync(record.installDir, { recursive: true, force: true });
       }
+      // 留空的 versions/ 与 <shortName>/ 一并删掉：全新安装要求应用根目录为空，
+      // 否则同 shortName 的应用（如退役旧号后装新号，MC10）会被「目录已存在」拒绝
+      if (record.installDir) {
+        pruneEmptyVersionParents(record.installDir);
+      }
 
       // 6. Preserve recovery metadata unless all app data was explicitly purged
       if (opts.purgeData) {
@@ -88,6 +96,36 @@ export class AppUninstallService {
     } catch (err) {
       await this.registry.updateStatus(appId, 'failed');
       throw err;
+    }
+  }
+
+  /** InboxModule 依赖本模块：经全局容器惰性取得；没有消息与待办中心时跳过，清理失败只记警告 */
+  private async removeInbox(appId: string): Promise<void> {
+    try {
+      const app = (global as any).nestApp;
+      if (!app) return;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { InboxService } = require('../../inbox/inbox.service');
+      const inbox = app.get(InboxService, { strict: false });
+      if (inbox) await inbox.removeForApp(appId);
+    } catch (err: any) {
+      this.logger.warn(`Failed to remove inbox items for ${appId}: ${err?.message ?? err}`);
+    }
+  }
+}
+
+/**
+ * 仅对版本目录协议（app-store/<shortName>/versions/<version>）生效：依次删除为空的
+ * versions/ 与 <shortName>/。rmdir 只删空目录，非空（如还有其他版本或数据）即停。
+ */
+function pruneEmptyVersionParents(installDir: string): void {
+  const versionsDir = path.dirname(installDir);
+  if (path.basename(versionsDir) !== 'versions') return;
+  for (const dir of [versionsDir, path.dirname(versionsDir)]) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      return;
     }
   }
 }

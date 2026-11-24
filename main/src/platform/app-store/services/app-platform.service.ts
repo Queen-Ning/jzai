@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -12,13 +12,37 @@ import { ToolBridgeService } from '../../../agent/tool-bridge/tool-bridge.servic
 import { AppCapabilityService } from './app-capability.service';
 import type { AppInstallService } from './app-install.service';
 import type { AppUpgradeService } from './app-upgrade.service';
+import type { AppUninstallService } from './app-uninstall.service';
 import { AppStagingService } from './app-staging.service';
 import { AppInstallOperationService } from './app-install-operation.service';
 import { AppLicenseService } from './app-license.service';
+import { AppLicenseRuntimeService } from './app-license-runtime.service';
 import { DevUploadService } from './dev-upload.service';
 import { SafeArchiveService } from './safe-archive.service';
 import { DbService } from '../../../db/db.service';
 import { createServicePrincipal } from '../runtime/invocation-principal';
+import { RESERVED_NAMESPACE_LABEL, isFirstPartyAppId } from '../first-party';
+import { HOSTED_BY_TAG_PREFIX } from '../app-state';
+import { AppAuditService } from './app-audit.service';
+import { AppGrantService } from './app-grant.service';
+import { loadActiveUser, userPrincipalOf } from './active-user';
+import { AppConfigService } from '../../../config/app-config.service';
+import { TemporalNotEnabledError, resolveTemporalSettings } from '../../system/temporal-config';
+import type {
+  SandboxArtifact, SandboxArtifactInput, SandboxBridgeHandler, SandboxHealth, SandboxInvokeRequest, SandboxInvokeResult,
+} from '../../sandbox/sandbox.types';
+
+/** SandboxService 中门面用到的部分（类本身惰性 require，避免 sandbox → app-store 的文件级循环） */
+interface SandboxServiceLike {
+  isEnabled(): boolean;
+  health(): SandboxHealth;
+  prepareArtifact(hostAppId: string, input: SandboxArtifactInput): Promise<SandboxArtifact>;
+  invoke(hostAppId: string, handle: string, request: SandboxInvokeRequest): Promise<SandboxInvokeResult>;
+  disposeArtifact(hostAppId: string, handle: string): Promise<void>;
+  disposeVersion(hostAppId: string, appId: string, version: string): Promise<{ disposed: number }>;
+  listArtifacts(hostAppId: string, appId?: string): SandboxArtifact[];
+  setBridgeHandler(hostAppId: string, handler: SandboxBridgeHandler | undefined): void;
+}
 
 /**
  * AppInstallService/AppUpgradeService 与 AppActivationService 存在构造期循环
@@ -33,10 +57,15 @@ function lazyUpgrade(): typeof AppUpgradeService {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   return require('./app-upgrade.service').AppUpgradeService;
 }
+/** AppUninstallService 同样经 AppActivationService 依赖本文件（MC02 host.uninstallApp） */
+function lazyUninstall(): typeof AppUninstallService {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  return require('./app-uninstall.service').AppUninstallService;
+}
 
 /**
  * 首方运行时通道（design-app-dev-mcp §3.4 AppContext.platform）。
- * 仅注入给声明 appstore:* 且通过首方校验的扩展包（jz-devtools）。
+ * 仅注入给声明 appstore:*、platform:temporal 或 platform:sandbox 且通过首方校验的扩展包（jz-devtools、企业套件等）。
  * 跨模块服务经 ModuleRef 惰性解析，避免 DI 循环。
  */
 export interface AppPlatformFacade {
@@ -71,6 +100,8 @@ export interface AppPlatformFacade {
     listInstalledApps(): Promise<Array<{
       appId: string; version: string; status: string;
       licenseBlob: string | null; licenseExpiresAt: string | null;
+      /** MC11：只读期截止时间（ISO）；不在只读期为 null */
+      licenseReadonlyUntil: string | null;
       installDir: string | null;
     }>>;
     /** 商城安装进度：创建 downloading 阶段的安装操作，面板凭 stageId 轮询 GET /stage/:stageId */
@@ -85,9 +116,87 @@ export interface AppPlatformFacade {
     /** 授权审计回写：仅限 'active' | 'license_expired'（其他状态由运行时状态机管理） */
     setAppStatus(appId: string, status: 'active' | 'license_expired'): Promise<void>;
   };
+  /**
+   * 托管宿主原语（appstore:host，MC02）。
+   * 卸载只作用于 manifest.tags 含 `hosted-by:{调用方 appId}` 的应用；权限查询的目标为调用方自身或其托管的应用。
+   * 每次调用写审计（app_id 为调用方）。
+   */
+  host?: {
+    listHostedApps(): Promise<HostedAppInfo[]>;
+    uninstallApp(appId: string, opts?: { purgeData?: boolean }): Promise<void>;
+    /** 用户在目标应用中持有的权限 id（含 default 为 user 的权限；管理员返回全部）；用户不存在或已停用返回 [] */
+    getAppPermissions(appId: string, userId: string): Promise<string[]>;
+    /** 用户不存在或已停用返回 null */
+    getUserProfile(userId: string): Promise<HostUserProfile | null>;
+    /** 按授权记录展开的权限持有人（不看 default，管理员无显式授权不返回，排除停用用户），最多 500 人 */
+    listPermissionHolders(
+      appId: string, permissionId: string, opts?: { departmentIds?: string[] },
+    ): Promise<PermissionHolders>;
+    /**
+     * 用户的上级（企业套件流程审批的升级，44 T-S3-09）：先取用户资料中的上级（jz_user_profiles.manager_id），
+     * 没有时取所在部门的负责人（jz_departments.head_user_id 或成员角色 head，不含本人），本人就是负责人时取上级部门的负责人。
+     * 只返回在用的用户；每次最多 100 个用户，查不到的为空数组。
+     */
+    listUserManagers(userIds: string[]): Promise<Record<string, string[]>>;
+  };
+  /**
+   * Temporal 平台组件（platform:temporal，MC13）：只返回连接参数，主台不引用 Temporal SDK。
+   * 每次调用都重新读取配置（system.json 修改后无需重启）。经独立进程 RPC 调用时同样返回 Promise。
+   */
+  temporal?: {
+    /** 未启用时抛 TEMPORAL_NOT_ENABLED；命名空间为调用方 shortName */
+    getConnectionOptions(): Promise<TemporalConnectionOptions>;
+    isEnabled(): Promise<boolean>;
+  };
+  /**
+   * 隔离插件运行平台（platform:sandbox，MC16）：托管应用的后端 WebAssembly 插件。
+   * 只能管理 tags 含 `hosted-by:{调用方}` 的应用的制品；未启用时 prepare 与 invoke 抛 SANDBOX_NOT_ENABLED。
+   * 经独立进程 RPC 调用时，onBridgeCall 的处理函数留在子进程，平台按需回调。
+   */
+  sandbox?: {
+    isEnabled(): Promise<boolean>;
+    health(): Promise<SandboxHealth>;
+    prepareArtifact(input: SandboxArtifactInput): Promise<SandboxArtifact>;
+    invoke(handle: string, request: SandboxInvokeRequest): Promise<SandboxInvokeResult>;
+    disposeArtifact(handle: string): Promise<void>;
+    disposeVersion(appId: string, version: string): Promise<{ disposed: number }>;
+    listArtifacts(appId?: string): Promise<SandboxArtifact[]>;
+    /** 注册能力桥处理函数（每个宿主一个，后注册的替换先注册的；传 null 取消） */
+    onBridgeCall(handler: SandboxBridgeHandler | null): Promise<void>;
+  };
 }
 
-export const FIRST_PARTY_APP_ID = /^com\.(jianzhi|menhu)\./;
+export interface TemporalConnectionOptions {
+  address: string;
+  namespace: string;
+}
+
+// 定义移到无依赖的 app-state.ts（panel 的应用入口也要用，T-P-19），这里保留导出
+export { HOSTED_BY_TAG_PREFIX };
+export const PERMISSION_HOLDERS_LIMIT = 500;
+export const USER_MANAGERS_LIMIT = 100;
+
+export interface HostedAppInfo {
+  appId: string;
+  version: string;
+  status: string;
+  tags: string[];
+}
+
+export interface HostUserProfile {
+  id: string;
+  name: string;
+  roleId: string | null;
+  departmentIds: string[];
+  permissions: string[];
+}
+
+export interface PermissionHolders {
+  userIds: string[];
+  /** 持有人超过 500 时为 true，userIds 只含前 500 个（按用户 id 排序） */
+  truncated: boolean;
+}
+
 
 @Injectable()
 export class AppPlatformService {
@@ -104,6 +213,8 @@ export class AppPlatformService {
     private readonly appLicenses: AppLicenseService,
     private readonly uploads: DevUploadService,
     private readonly archives: SafeArchiveService,
+    // @Optional：spec 直构不传时只看环境变量（system.json 视为空）
+    @Optional() private readonly appConfig?: AppConfigService,
   ) {}
 
   /**
@@ -111,7 +222,7 @@ export class AppPlatformService {
    * 非首方 appId / 未声明 appstore:* → undefined（普通包拿不到平台能力）。
    */
   buildFacade(manifest: AppManifest): AppPlatformFacade | undefined {
-    if (!FIRST_PARTY_APP_ID.test(manifest.appId)) return undefined;
+    if (!isFirstPartyAppId(manifest.appId)) return undefined;
     const caps = manifest.platformCapabilities ?? [];
     const facade: AppPlatformFacade = {};
 
@@ -147,11 +258,229 @@ export class AppPlatformService {
           this.installPackageTracked(stageId, packagePath),
         upgradePackageTracked: (stageId, appId, packagePath) =>
           this.upgradePackageTracked(stageId, appId, packagePath),
-        setAppLicense: (appId, licenseBlob) => this.appLicenses.setLicense(appId, licenseBlob),
+        setAppLicense: async (appId, licenseBlob) => { await this.appLicenses.setLicense(appId, licenseBlob); },
         setAppStatus: (appId, status) => this.setAppStatus(appId, status),
       };
     }
+    if (caps.includes('appstore:host')) {
+      const caller = manifest.appId;
+      facade.host = {
+        listHostedApps: () => this.listHostedApps(caller),
+        uninstallApp: (appId, opts) => this.uninstallHostedApp(caller, appId, opts),
+        getAppPermissions: (appId, userId) => this.getAppPermissions(caller, appId, userId),
+        getUserProfile: userId => this.getUserProfile(caller, userId),
+        listPermissionHolders: (appId, permissionId, opts) =>
+          this.listPermissionHolders(caller, appId, permissionId, opts),
+        listUserManagers: userIds => this.listUserManagers(caller, userIds),
+      };
+    }
+    if (caps.includes('platform:temporal')) {
+      const namespace = manifest.shortName;
+      facade.temporal = {
+        getConnectionOptions: async () => {
+          const settings = this.temporalSettings();
+          if (!settings.enabled) throw new TemporalNotEnabledError();
+          return { address: settings.address, namespace };
+        },
+        isEnabled: async () => this.temporalSettings().enabled,
+      };
+    }
+    if (caps.includes('platform:sandbox')) {
+      const caller = manifest.appId;
+      const svc = () => this.sandboxService();
+      facade.sandbox = {
+        isEnabled: async () => svc().isEnabled(),
+        health: async () => svc().health(),
+        prepareArtifact: input => svc().prepareArtifact(caller, input),
+        invoke: (handle, request) => svc().invoke(caller, handle, request),
+        disposeArtifact: handle => svc().disposeArtifact(caller, handle),
+        disposeVersion: (appId, version) => svc().disposeVersion(caller, appId, version),
+        listArtifacts: async appId => svc().listArtifacts(caller, appId),
+        onBridgeCall: async handler => { svc().setBridgeHandler(caller, typeof handler === 'function' ? handler : undefined); },
+      };
+    }
     return Object.keys(facade).length > 0 ? facade : undefined;
+  }
+
+  /** MC16：SandboxModule 不导入 AppStoreModule，类在用到时才 require，经全局容器取得 */
+  private sandboxService(): SandboxServiceLike {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { SandboxService } = require('../../sandbox/sandbox.service');
+    const svc = this.moduleRef.get(SandboxService, { strict: false }) as SandboxServiceLike | undefined;
+    if (!svc) throw new Error('Sandbox service is not available');
+    return svc;
+  }
+
+  private temporalSettings() {
+    return resolveTemporalSettings(this.appConfig?.getSystemConfig() ?? {});
+  }
+
+  // ── host 原语实现（appstore:host，MC02）──
+  // AppGrantService、AppUninstallService、AppAuditService 惰性取得：AppUninstallService 经
+  // AppActivationService 依赖本服务，构造注入会成环
+
+  private audit(): AppAuditService {
+    return this.moduleRef.get(AppAuditService, { strict: false });
+  }
+
+  private isHostedBy(app: { manifest?: AppManifest | null } | null | undefined, caller: string): boolean {
+    return (app?.manifest?.tags ?? []).includes(`${HOSTED_BY_TAG_PREFIX}${caller}`);
+  }
+
+  /** 权限查询的目标：调用方自身或其托管的应用；否则拒绝 */
+  private async requireSelfOrHosted(caller: string, appId: string) {
+    const app = await this.registry.findOne(appId);
+    if (!app) throw new NotFoundException(`App ${appId} not found`);
+    if (appId !== caller && !this.isHostedBy(app, caller)) {
+      throw new ForbiddenException(`App ${appId} is not hosted by ${caller}`);
+    }
+    return app;
+  }
+
+  private async listHostedApps(caller: string): Promise<HostedAppInfo[]> {
+    const apps = (await this.registry.findAll()).filter(a => this.isHostedBy(a, caller));
+    await this.audit().log(caller, 'host_list_hosted_apps', null, { count: apps.length });
+    return apps.map(a => ({
+      appId: a.appId,
+      version: a.version,
+      status: a.status,
+      tags: [...(a.manifest?.tags ?? [])],
+    }));
+  }
+
+  private async uninstallHostedApp(caller: string, appId: string, opts?: { purgeData?: boolean }): Promise<void> {
+    const app = await this.registry.findOne(appId);
+    if (!app) throw new NotFoundException(`App ${appId} not found`);
+    if (!this.isHostedBy(app, caller)) {
+      throw new ForbiddenException(`App ${appId} is not hosted by ${caller}`);
+    }
+    const purgeData = opts?.purgeData === true;
+    await this.moduleRef.get(lazyUninstall(), { strict: false }).uninstall(appId, { purgeData });
+    await this.audit().log(caller, 'host_uninstall_app', null, { appId, purgeData });
+  }
+
+  private async getAppPermissions(caller: string, appId: string, userId: string): Promise<string[]> {
+    const app = await this.requireSelfOrHosted(caller, appId);
+    const declared = (app.manifest?.permissions ?? []).map(p => p.id);
+    const user = await loadActiveUser(this.db, userId);
+    let held: string[] = [];
+    if (user && user.permissions.includes('sys:admin')) {
+      held = declared;
+    } else if (user) {
+      const grants = this.moduleRef.get(AppGrantService, { strict: false });
+      const principal = userPrincipalOf(user, `app-platform:${caller}`);
+      for (const permissionId of declared) {
+        if (await grants.hasPermissionForPrincipal(appId, permissionId, principal)) held.push(permissionId);
+      }
+    }
+    await this.audit().log(caller, 'host_get_app_permissions', null, {
+      appId, userId, found: !!user, count: held.length,
+    });
+    return held;
+  }
+
+  private async getUserProfile(caller: string, userId: string): Promise<HostUserProfile | null> {
+    const user = await loadActiveUser(this.db, userId);
+    await this.audit().log(caller, 'host_get_user_profile', null, { userId, found: !!user });
+    return user
+      ? { id: user.id, name: user.name, roleId: user.roleId, departmentIds: user.departmentIds, permissions: user.permissions }
+      : null;
+  }
+
+  /**
+   * 按 jz_app_grants 展开权限持有人：直授用户、角色成员（jz_users.role_id）、部门成员（jz_department_members，
+   * 只看直属成员，与 AppGrantService 的判定一致）。去重、排除停用用户；departmentIds 给出时只保留属于其中
+   * 任一部门的用户（空数组即无人）。不看 default，管理员没有显式授权时不返回。
+   */
+  private async listPermissionHolders(
+    caller: string, appId: string, permissionId: string, opts?: { departmentIds?: string[] },
+  ): Promise<PermissionHolders> {
+    const app = await this.requireSelfOrHosted(caller, appId);
+    if (!(app.manifest?.permissions ?? []).some(p => p.id === permissionId)) {
+      throw new BadRequestException(`Permission ${permissionId} not declared by ${appId}`);
+    }
+    const departmentIds = opts?.departmentIds ? [...opts.departmentIds] : null;
+    const { rows } = await this.db.query(
+      `WITH g AS (
+         SELECT target_type, target_id FROM jz_app_grants
+         WHERE app_id = $1 AND permission_id = $2 AND level <> 'none'
+       ), holders AS (
+         SELECT target_id AS user_id FROM g WHERE target_type = 'user'
+         UNION
+         SELECT u.id FROM jz_users u JOIN g ON g.target_type = 'role' AND u.role_id = g.target_id
+         UNION
+         SELECT dm.user_id FROM jz_department_members dm
+           JOIN g ON g.target_type = 'department' AND dm.department_id = g.target_id
+       )
+       SELECT u.id FROM holders h JOIN jz_users u ON u.id = h.user_id
+       WHERE u.status <> 'disabled'
+         AND ($3::text[] IS NULL OR EXISTS (
+           SELECT 1 FROM jz_department_members d WHERE d.user_id = u.id AND d.department_id = ANY($3::text[])
+         ))
+       ORDER BY u.id
+       LIMIT ${PERMISSION_HOLDERS_LIMIT + 1}`,
+      [appId, permissionId, departmentIds],
+    );
+    const truncated = rows.length > PERMISSION_HOLDERS_LIMIT;
+    const userIds = rows.slice(0, PERMISSION_HOLDERS_LIMIT).map((r: any) => r.id);
+    await this.audit().log(caller, 'host_list_permission_holders', null, {
+      appId, permissionId, departmentIds, count: userIds.length, truncated,
+    });
+    return { userIds, truncated };
+  }
+
+  /**
+   * 用户的上级：资料中的上级优先；没有时为所在部门的负责人（head_user_id 与成员角色 head，不含本人）；
+   * 本人是所在部门的负责人时取上级部门的负责人。结果只含在用的用户。
+   */
+  private async listUserManagers(caller: string, userIds: string[]): Promise<Record<string, string[]>> {
+    if (!Array.isArray(userIds) || userIds.some(id => typeof id !== 'string')) {
+      throw new BadRequestException('userIds must be an array of strings');
+    }
+    const ids = [...new Set(userIds)];
+    if (ids.length > USER_MANAGERS_LIMIT) throw new BadRequestException(`At most ${USER_MANAGERS_LIMIT} users per call`);
+    const out: Record<string, string[]> = Object.fromEntries(ids.map(id => [id, [] as string[]]));
+    if (!ids.length) return out;
+    const { rows } = await this.db.query(
+      `WITH u AS (SELECT unnest($1::text[]) AS user_id),
+       heads AS (
+         SELECT d.id AS dept_id, d.parent_id, d.head_user_id AS head FROM jz_departments d WHERE d.head_user_id IS NOT NULL
+         UNION
+         SELECT d.id, d.parent_id, m.user_id FROM jz_departments d
+           JOIN jz_department_members m ON m.department_id = d.id AND m.role = 'head'
+       ),
+       profile AS (
+         SELECT u.user_id, p.manager_id AS manager, 1 AS rank FROM u
+           JOIN jz_user_profiles p ON p.user_id = u.user_id WHERE p.manager_id IS NOT NULL AND p.manager_id <> u.user_id
+       ),
+       dept AS (
+         SELECT u.user_id, h.head AS manager, 2 AS rank FROM u
+           JOIN jz_department_members dm ON dm.user_id = u.user_id
+           JOIN heads h ON h.dept_id = dm.department_id WHERE h.head <> u.user_id
+       ),
+       parent AS (
+         SELECT u.user_id, ph.head AS manager, 3 AS rank FROM u
+           JOIN heads own ON own.head = u.user_id
+           JOIN heads ph ON ph.dept_id = own.parent_id WHERE ph.head <> u.user_id
+       ),
+       c AS (SELECT * FROM profile UNION ALL SELECT * FROM dept UNION ALL SELECT * FROM parent)
+       SELECT c.user_id, c.manager, c.rank FROM c JOIN jz_users mu ON mu.id = c.manager
+       WHERE mu.status <> 'disabled'
+       ORDER BY c.user_id, c.rank, c.manager`,
+      [ids],
+    );
+    const best = new Map<string, number>();
+    for (const r of rows as Array<{ user_id: string; manager: string; rank: number }>) {
+      const rank = Number(r.rank);
+      const top = best.get(r.user_id);
+      if (top !== undefined && rank > top) continue;
+      best.set(r.user_id, rank);
+      if (!out[r.user_id].includes(r.manager)) out[r.user_id].push(r.manager);
+    }
+    await this.audit().log(caller, 'host_list_user_managers', null, {
+      count: ids.length, found: Object.values(out).filter(m => m.length).length,
+    });
+    return out;
   }
 
   // ── market 原语实现 ──
@@ -165,7 +494,22 @@ export class AppPlatformService {
     if (!['active', 'license_expired'].includes(app.status)) {
       throw new Error(`App ${appId} 当前状态 ${app.status} 不允许审计回写`);
     }
+    // MC11：运行状态跟随授权状态。恢复为 active 由运行时复查完整性后改注册表；到期先改注册表再停用或进入只读期
+    const runtime = this.licenseRuntime();
+    if (status === 'active' && app.status === 'license_expired' && runtime) {
+      await runtime.restore(app);
+      return;
+    }
     await this.registry.updateStatus(appId, status);
+    if (runtime && status === 'license_expired') await runtime.applyStatus(appId, app.status, status);
+  }
+
+  private licenseRuntime(): AppLicenseRuntimeService | undefined {
+    try {
+      return this.moduleRef.get(AppLicenseRuntimeService, { strict: false });
+    } catch {
+      return undefined;
+    }
   }
 
   private async getInstallationToken(): Promise<string> {
@@ -208,6 +552,7 @@ export class AppPlatformService {
       status: a.status,
       licenseBlob: a.licenseBlob ?? null,
       licenseExpiresAt: a.licenseExpiresAt ? a.licenseExpiresAt.toISOString() : null,
+      licenseReadonlyUntil: a.licenseReadonlyUntil ? new Date(a.licenseReadonlyUntil).toISOString() : null,
       installDir: a.installDir ?? null,
     }));
   }
@@ -295,6 +640,14 @@ export class AppPlatformService {
 
   // ── 实现 ──
 
+  /**
+   * 安装后的实际状态：需要授权而没有有效许可证的应用装好后是 license_expired（MC11），
+   * 不能固定返回 active，否则开发 MCP 的调用方以为应用可用（T-S1-01 发现）。
+   */
+  private async installedStatus(appId: string): Promise<string> {
+    return (await this.registry.findOne(appId))?.status ?? 'active';
+  }
+
   private async stageAndInstall(
     files: Record<string, string>,
     config?: Record<string, unknown>,
@@ -305,7 +658,7 @@ export class AppPlatformService {
       const manifest = this.readManifest(dir);
       await this.moduleRef.get(lazyInstall(), { strict: false })
         .installFromStage(dir, config ?? {}, () => {}, {});
-      return { appId: manifest.appId, status: 'active' };
+      return { appId: manifest.appId, status: await this.installedStatus(manifest.appId) };
     } finally {
       fs.rm(dir, { recursive: true, force: true }, () => {});
     }
@@ -350,7 +703,7 @@ export class AppPlatformService {
       const manifest = this.readManifest(dir);
       await this.moduleRef.get(lazyInstall(), { strict: false })
         .installFromStage(dir, config ?? {}, () => {}, {});
-      return { appId: manifest.appId, status: 'active' };
+      return { appId: manifest.appId, status: await this.installedStatus(manifest.appId) };
     } finally {
       fs.rm(dir, { recursive: true, force: true }, () => {});
       this.uploads.release(uploadId);
@@ -408,7 +761,16 @@ export class AppPlatformService {
       AGENT_TOOL_NOT_DECLARED: '把该工具加入 manifest backend.toolProviders[].toolIds，或从 agent yaml 的 tools 中移除',
       PLATFORM_TOOL_NOT_ALLOWED: '从 usesPlatformTools 移除该工具；仅 L1 数据生成/L2 连接器只读/L3 界面控制类可声明',
       DEV_CAP_NOT_FIRST_PARTY: 'appstore:* 能力仅首方包可声明，请移除',
+      PLATFORM_CAP_NOT_FIRST_PARTY: 'platform:*（如 platform:temporal）是平台组件通道，仅首方包可声明，请移除',
+      LICENSE_POLICY_NOT_FIRST_PARTY: 'licensePolicy.onExpired "readonly" 仅首方包可用，请改为 "deactivate" 或删除 licensePolicy',
+      INBOX_ACTION_HANDLER_UNKNOWN: 'inbox.actionHandler 须写成 "Class.method"，并列在 backend.controllers[].handlers 中',
+      PERM_GROUP_INVALID: 'permissions[].group 只能取 function、operation、scope、field、other（审批与联动调整归 operation），或不写（按 other）',
+      PERM_TOO_MANY: '单个应用最多 500 个权限项：合并同类权限，或把功能拆到多个应用',
+      PERM_MANY: '权限项超过 300 个时设置页难以维护：考虑合并同类权限，或把功能拆到多个应用',
       MCP_EXPOSE_NOT_FIRST_PARTY: 'mcpExposed 仅首方包可声明，请移除',
+      RESERVED_APP_ID_NAMESPACE: `${RESERVED_NAMESPACE_LABEL} 为保留命名空间，请改用自己的反向域名 appId（首方应用为 io.jzai.*）`,
+      PROCESS_RUNTIME_NOT_FIRST_PARTY: 'backend.runtime "process"（独立进程）仅首方包可用，请移除该字段',
+      POOL_MAX_NOT_FIRST_PARTY: 'database.poolMax 第三方包最多为 5，请改为 5 或更小（不写时默认 3）；6 至 20 只开放给首方包（io.jzai.*）',
       MIGRATION_VERSION_GAP: 'migrations 版本号从 1 开始连续编号',
       MIGRATION_FILE_MISSING: '补齐迁移 SQL 文件或从 manifest.migrations 移除该条',
       MISSING_README: '补充 README.md（≥200 字符，说明用途与配置）',

@@ -66,7 +66,16 @@ describe('jz-devtools scaffold rendering', () => {
     }
 
     expect(result.files['build.mjs']).toContain("path.join(ROOT, 'sdk-lib')");
-    expect(result.files['package-app.mjs']).toContain("'manifest.json'");
+    // MC05：react-dom 也别名到 shim，共享宿主实例
+    expect(result.files['build.mjs']).toContain("'react-dom': path.join(SDK_LIB, 'react-dom-shim.ts')");
+    // 打包 CLI 只是入口；默认打包输入（含 manifest.json）在注入的 packager 库里
+    expect(result.files['package-app.mjs']).toContain("from './packager/packager.mjs'");
+    expect(result.files['packager/packager.mjs']).toContain("'manifest.json'");
+    if (manifest.panels?.length) {
+      for (const shim of ['react-shim.ts', 'react-dom-shim.ts', 'jsx-runtime-shim.ts']) {
+        expect(result.files[`sdk-lib/${shim}`]).toBeDefined();
+      }
+    }
     expect(JSON.parse(result.files['package.json']).scripts).toEqual(expect.objectContaining({ build: expect.any(String), package: expect.any(String) }));
     expect(result.files['package-lock.json']).toContain('"@jianzhi/sample-app"');
     expect(result.templateVersion).toMatch(/^\d+\.\d+\.\d+/);

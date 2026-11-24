@@ -5,6 +5,9 @@ import type { PoolClient } from 'pg';
 import { AppPoolService } from '../services/app-pool.service';
 import { AppLogService } from '../services/app-log.service';
 import type { AppPlatformFacade } from '../services/app-platform.service';
+import { VALID_LICENSE } from './process/protocol';
+import type { AppLicenseSnapshot } from './process/protocol';
+import type { AppInboxClient } from '../../inbox/inbox.types';
 import type { AppConnectionClient } from '../../../agent/tool-bridge/tool-provider.interface';
 import { WorkspaceService } from '../../../workspace/workspace.service';
 import { ModelRouterService } from '../../../model-router/model-router.service';
@@ -38,8 +41,12 @@ export interface AppContextDeps {
   toolExecutor?: (toolId: string, params: unknown) => Promise<unknown>;
   /** 按 bindingId 调用用户授权连接；后台调用每次解析持久 service principal */
   connections?: AppConnectionClient;
-  /** 首方运行时通道（仅声明 appstore:* 的首方包注入，见 AppPlatformService.buildFacade） */
+  /** 首方运行时通道（仅声明 appstore:* 或 platform:temporal 的首方包注入，见 AppPlatformService.buildFacade） */
   platform?: AppPlatformFacade;
+  /** MC11：当前授权状态（AppLicenseRuntimeService 提供）；缺省为 valid */
+  license?: () => AppLicenseSnapshot;
+  /** MC07：消息与待办写入（manifest.platformCapabilities 含 inbox:publish 时注入；appId 已绑定） */
+  inbox?: AppInboxClient;
 }
 
 /**
@@ -140,8 +147,24 @@ export class AppContext {
    * 仅当 manifest 声明 appstore:* 且为首方 appId 时由 activation 注入；
    * 普通扩展包访问为 undefined——不得假定其存在。
    */
+  /**
+   * 授权状态（MC11）：valid 正常；readonly 为到期后的只读期（应用自行拒绝写入，见 onLicenseChange）。
+   * 到期且不在只读期时后端已被停用，应用不会再被调用。
+   */
+  readonly license = {
+    getState: (): AppLicenseSnapshot => ({ ...(this.deps.license?.() ?? VALID_LICENSE) }),
+  };
+
   get platform(): AppPlatformFacade | undefined {
     return this.deps.platform;
+  }
+
+  /**
+   * 消息与待办（MC07）：sendMessage、upsertTask。只在 manifest.platformCapabilities 含 inbox:publish
+   * 且主台提供消息与待办中心时存在，否则为 undefined——应用应在 undefined 时只用自己的任务页。
+   */
+  get inbox(): AppInboxClient | undefined {
+    return this.deps.inbox;
   }
 
   /** 应用目录 {workspace}/app-store/{shortName} 内的沙箱文件访问（防穿越） */

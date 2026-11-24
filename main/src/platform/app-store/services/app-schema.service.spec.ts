@@ -14,7 +14,7 @@ describe('AppSchemaService', () => {
     };
     const service = new AppSchemaService(db as any);
     const manifest = {
-      appId: 'com.menhu.drawing.dimtuner',
+      appId: 'com.example.drawing.dimtuner',
       database: {
         schemaName: 'app_dim_tuner',
         statementTimeoutMs: 30000,
@@ -53,7 +53,7 @@ describe('AppSchemaService', () => {
     };
     const service = new AppSchemaService(db as any);
     const manifest = {
-      appId: 'com.menhu.drawing.dimtuner',
+      appId: 'com.example.drawing.dimtuner',
       database: { schemaName: 'app_dim_tuner' },
     } as any;
 
@@ -75,7 +75,7 @@ describe('AppSchemaService', () => {
     };
     const service = new AppSchemaService(db as any);
     const manifest = {
-      appId: 'com.menhu.drawing.dimtuner',
+      appId: 'com.example.drawing.dimtuner',
       database: { schemaName: 'app_dim_tuner' },
     } as any;
 

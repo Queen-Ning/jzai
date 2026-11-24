@@ -36,9 +36,10 @@ describe('T3.2 validator Check 10.6 降级', () => {
 
 function makeSvc(opts: {
   allowed?: boolean; canView?: boolean; userExists?: boolean; withExpose?: boolean; withAccess?: boolean;
+  status?: string; readonlyUntil?: string;
 }) {
   const apps = [
-    { appId: 'com.third.tp1', status: 'active',
+    { appId: 'com.third.tp1', status: opts.status ?? 'active', licenseReadonlyUntil: opts.readonlyUntil,
       manifest: { backend: { toolProviders: [{ toolIds: ['tp_do'], mcpExposed: true }] } } },
   ];
   const bridge = { getCatalog: () => [{ id: 'tp_do', label: 'tp', description: 'd', parameters: {} }],
@@ -65,12 +66,15 @@ function makeSvc(opts: {
   return { svc, bridge, expose, access };
 }
 
+// 审计主体是令牌（dev-mcp:<tokenId>），授权按签发人（MC01）
+const ACTOR = 'dev-mcp:dtok_1';
+
 describe('T3.2 dev-mcp 门控', () => {
   it('用例2：未审批 → listTools 不含其工具、callTool 拒绝（not exposed）', async () => {
     const { svc, expose } = makeSvc({ allowed: false });
     const tools = await svc.listTools();
     expect(tools.some(t => t.name === 'tp_do')).toBe(false);
-    await expect(svc.callTool('tp_do', {}, 'dev1')).rejects.toThrow('not exposed');
+    await expect(svc.callTool('tp_do', {}, ACTOR, 'dev1')).rejects.toThrow('not exposed');
     expect(expose!.isAllowed).toHaveBeenCalledWith('com.third.tp1');
   });
 
@@ -78,24 +82,40 @@ describe('T3.2 dev-mcp 门控', () => {
     const { svc, bridge } = makeSvc({ allowed: true, canView: true });
     const tools = await svc.listTools();
     expect(tools.some(t => t.name === 'tp_do')).toBe(true);
-    await expect(svc.callTool('tp_do', { x: 1 }, 'dev1')).resolves.toEqual({ ok: true });
+    await expect(svc.callTool('tp_do', { x: 1 }, ACTOR, 'dev1')).resolves.toEqual({ ok: true });
     expect(bridge.callTool).toHaveBeenCalled();
   });
 
-  it('用例4：审批但 actor 无 tool grant → callTool 拒绝（双保险）；actor 不存在同样拒绝', async () => {
+  it('用例4：审批但签发人无 tool grant → callTool 拒绝（双保险）；签发人不存在报 issuer not found', async () => {
     const { svc, access } = makeSvc({ allowed: true, canView: false });
-    await expect(svc.callTool('tp_do', {}, 'dev1')).rejects.toThrow('No tool grant');
+    await expect(svc.callTool('tp_do', {}, ACTOR, 'dev1')).rejects.toThrow('No tool grant');
     expect(access!.canView).toHaveBeenCalledWith('tool', 'tp_do', expect.objectContaining({ userId: 'dev1', permissions: ['sys:admin'] }));
 
     const c2 = makeSvc({ allowed: true, userExists: false });
-    await expect(c2.svc.callTool('tp_do', {}, 'ghost')).rejects.toThrow('No tool grant');
+    await expect(c2.svc.callTool('tp_do', {}, ACTOR, 'ghost')).rejects.toThrow('Dev token issuer not found');
+    expect(c2.bridge.callTool).not.toHaveBeenCalled();
   });
 
-  it('用例5：未接线 expose/access（旧式构造）→ 保持旧行为全量聚合且直调（零破坏）', async () => {
+  it('用例5：未接线 expose/access（旧式构造）→ 全量聚合且直调；签发人仍须存在', async () => {
     const { svc } = makeSvc({ withExpose: false, withAccess: false });
     const tools = await svc.listTools();
     expect(tools.some(t => t.name === 'tp_do')).toBe(true); // 旧语义：声明即暴露
-    await expect(svc.callTool('tp_do', {}, 'dev1')).resolves.toBeTruthy();
+    await expect(svc.callTool('tp_do', {}, ACTOR, 'dev1')).resolves.toBeTruthy();
+    await expect(svc.callTool('tp_do', {}, ACTOR)).rejects.toThrow('Dev token issuer not found');
+  });
+
+  // T-P-18 补修（MC11）：授权只读期内工具照常暴露与转发（写入由应用自行拒绝），只读期满后隐藏
+  it('授权只读期内 → listTools 含其工具、callTool 转发；只读期满 → not exposed', async () => {
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    const readonly = makeSvc({ allowed: true, status: 'license_expired', readonlyUntil: future });
+    expect((await readonly.svc.listTools()).some(t => t.name === 'tp_do')).toBe(true);
+    await expect(readonly.svc.callTool('tp_do', {}, ACTOR, 'dev1')).resolves.toEqual({ ok: true });
+
+    const past = new Date(Date.now() - 1_000).toISOString();
+    const ended = makeSvc({ allowed: true, status: 'license_expired', readonlyUntil: past });
+    expect((await ended.svc.listTools()).some(t => t.name === 'tp_do')).toBe(false);
+    await expect(ended.svc.callTool('tp_do', {}, ACTOR, 'dev1')).rejects.toThrow('not exposed');
+    expect(ended.bridge.callTool).not.toHaveBeenCalled();
   });
 
   it('首方 APP 不经 expose 查询亦恒通（expose.isAllowed 对首方短路由服务内部保证）', async () => {

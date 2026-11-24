@@ -18,9 +18,12 @@ import CoWorkerPanel from '@/modules/coworker/CoWorkerPanel';
 import CustomDashboardPanel from '@/components/dashboard/CustomDashboardPanel';
 import FloatingPanel from '@/components/FloatingPanel';
 import MyEmailPanel from '@/components/MyEmailPanel';
-import { DynamicPanelLoader } from '@/components/DynamicPanelLoader';
+import { DynamicPanelLoader, OPEN_PANEL_EVENT, type OpenPanelDetail } from '@/components/DynamicPanelLoader';
+import { applyDeepLink, parseDeepLink } from '@/lib/deep-link';
+import { toast } from 'sonner';
 import MobileShell from '@/components/mobile/MobileShell';
 import MobileAccessQr from '@/components/MobileAccessQr';
+import InboxBell from '@/components/inbox/InboxBell';
 import SessionList from '@/components/SessionList';
 import SidebarCustomizeModal from '@/components/SidebarCustomizeModal';
 import ShortcutCustomizeModal from '@/components/ShortcutCustomizeModal';
@@ -48,9 +51,10 @@ export default function Home() {
   const [reRegisterState, setReRegisterState] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [reRegisterError, setReRegisterError] = useState('');
   const [forcePwDone, setForcePwDone] = useState(false);
-  const [activeNav, setActiveNav] = useState('chat');
-  const [contentPanel, setContentPanel] = useState<{ title: string; type: string; icon?: string } | null>(null);
-  const [visitedPanels, setVisitedPanels] = useState<Set<string>>(new Set());
+  // 多面板模型：openPanels 为已打开面板（顺序 = tab 顺序，也是 keep-alive 挂载集合），
+  // activePanelId 为当前激活面板；null 表示无打开面板 → 全屏对话页
+  const [openPanels, setOpenPanels] = useState<string[]>([]);
+  const [activePanelId, setActivePanelId] = useState<string | null>(null);
   const [activePdfFileId, setActivePdfFileId] = useState<string>('');
   const [chatStarted, setChatStarted] = useState(false);
   const [expanded, setExpanded] = useState(false);
@@ -76,7 +80,10 @@ export default function Home() {
   // 从移动地址登录时始终手机模式；其他地址按视口宽度自动感知
   const isMobile = useIsMobile() || forceMobile;
   const msgDisplay = useMessageDisplay(activeAgent);
-  const { panels: sidebarPanels, save: saveSidebar, reset: resetSidebar } = useSidebar(token);
+  const { panels: sidebarPanels, loaded: sidebarLoaded, save: saveSidebar, reset: resetSidebar } = useSidebar(token);
+  // MC06：每个三方面板的面板内路由（深链 ?r=、sdk.nav.open、sdk.nav.setRoute）；首个面板列表到达后解析一次地址栏
+  const [panelRoutes, setPanelRoutes] = useState<Record<string, string | null>>({});
+  const deepLinkDoneRef = useRef(false);
   const { shortcuts, save: saveShortcuts, reset: resetShortcuts } = useShortcuts(token);
 
   // Single global chat — agentId determines which backend agent to use
@@ -300,35 +307,52 @@ export default function Home() {
     }
   }, [token]);
 
-  const handleNavigate = useCallback((id: string) => {
-    setActiveNav(id);
-    if (id === 'chat') {
-      setContentPanel(null);
-      setExpanded(false);
-      setShowFloating(false);
-      setActiveAgent('main');
-      newSession();  // 从主页进入聊天即开新会话：清空内存里残留的 sessionId/messages，避免接上上次历史
-      setChatStarted(false);
-    } else {
-      const panel = sidebarPanels.find(p => p.id === id);
-      const iconStr = panel?.icon?.startsWith('img:') ? '' : (panel?.icon || '');
-      const title = panel ? `${iconStr} ${panel.name}`.trim() : id;
-      setContentPanel({ title, type: id, icon: panel?.icon });
-      setVisitedPanels(prev => new Set(prev).add(id));
-      // Auto-switch to paired agent (driven by DB agent_id column)
-      const agentId = panel?.agentId;
-      if (agentId) {
-        setActiveAgent(agentId);
-        setChatStarted(true);
-      }
+  // 激活面板：未打开则并入 openPanels（需求5 去重），置为当前；
+  // 面板绑定了智能体（DB agent_id 列）则随激活切换（需求4）
+  const activatePanel = useCallback((id: string) => {
+    setOpenPanels(prev => prev.includes(id) ? prev : [...prev, id]);
+    setActivePanelId(id);
+    const panel = sidebarPanels.find(p => p.id === id);
+    const agentId = panel?.agentId;
+    if (agentId) {
+      setActiveAgent(agentId);
+      setChatStarted(true);
     }
-  }, [sidebarPanels, newSession]);
+  }, [sidebarPanels]);
+
+  // 关闭单个面板：关的是激活 tab 时激活其右侧邻居（无右侧则左侧）；
+  // 全部关完回全屏对话页——保留当前对话与智能体（需求3）
+  const closePanel = useCallback((id: string) => {
+    const idx = openPanels.indexOf(id);
+    const next = openPanels.filter(p => p !== id);
+    setOpenPanels(next);
+    setActivePanelId(cur => cur !== id ? cur : (next[idx] ?? next[idx - 1] ?? null));
+    if (next.length === 0) { setExpanded(false); setShowFloating(false); }
+    if (activeAgent === 'skill_builder') setActiveAgent('main');
+  }, [openPanels, activeAgent]);
+
+  // 关闭全部面板（logo 点击 / 回主页）：回全屏对话页，保留当前对话与智能体
+  const closeAllPanels = useCallback(() => {
+    setOpenPanels([]);
+    setActivePanelId(null);
+    setExpanded(false);
+    setShowFloating(false);
+  }, []);
+
+  const handleNavigate = useCallback((id: string) => {
+    if (id === 'chat') {
+      closeAllPanels();
+    } else {
+      activatePanel(id);
+    }
+  }, [activatePanel, closeAllPanels]);
 
   const collectPageContext = useCallback(() => {
+    const activePanel = sidebarPanels.find(p => p.id === activePanelId);
     const ctx: Record<string, any> = {
-      panel: contentPanel?.type,
-      title: contentPanel?.title,
-      nav: activeNav,
+      panel: activePanelId,
+      title: activePanel?.name,
+      nav: activePanelId ?? 'chat',
       url: window.location.href,
       pdfFileId: activePdfFileId || undefined,
     };
@@ -347,7 +371,7 @@ export default function Home() {
     });
     ctx.labels = labels;
     return ctx;
-  }, [contentPanel, activeNav, activePdfFileId]);
+  }, [activePanelId, sidebarPanels, activePdfFileId]);
 
   const handleSend = useCallback((text: string, extraContext?: Record<string, any>) => {
     if (!chatStarted) setChatStarted(true);
@@ -437,7 +461,7 @@ export default function Home() {
   const handleAgentSelect = useCallback((agentId: string) => {
     if (agentId === 'main') {
       setActiveAgent('main');
-      setContentPanel(null);
+      closeAllPanels();
       newSession();  // 切回主智能体即开新会话，避免内存残留的旧 sessionId/messages 接上上次历史
       setChatStarted(false);
     } else {
@@ -446,11 +470,9 @@ export default function Home() {
       const agentInfo = agentList.find(a => a.id === agentId);
       if (agentInfo?.defaultPanel && !isMobile) {
         handleNavigate(agentInfo.defaultPanel);
-      } else {
-        setActiveNav('chat');
       }
     }
-  }, [agentList, handleNavigate, newSession, isMobile]);
+  }, [agentList, handleNavigate, newSession, isMobile, closeAllPanels]);
 
   /**
    * Panel → Agent 结构化通道（PLAT-012）：面板 sdk.agent.send() 的宿主侧路由。
@@ -474,22 +496,77 @@ export default function Home() {
     handleSend(msg.text, extraContext);
   }, [activeAgent, handleAgentSelect, handleSend]);
 
-  // Navigate panel only (no agent switch) — used by agent actions to avoid hijacking conversation
-  const handleNavigateOnly = useCallback((id: string) => {
-    if (id === 'chat') {
-      setContentPanel(null);
-      setExpanded(false);
-      setShowFloating(false);
-    } else {
-      setActiveNav(id);
-      const panel = sidebarPanels.find(p => p.id === id);
-      const iconStr = panel?.icon?.startsWith('img:') ? '' : (panel?.icon || '');
-      const title = panel ? `${iconStr} ${panel.name}`.trim() : id;
-      setContentPanel({ title, type: id, icon: panel?.icon });
-      setVisitedPanels(prev => new Set(prev).add(id));
-      // NOTE: no panelAgentMap agent switch — agent stays unchanged
+  /**
+   * MC06：按面板 id 打开面板并带上面板内路由（地址栏深链与 sdk.nav.open 共用）。
+   * 桌面端按用户点击侧栏处理（handleNavigate，含配对智能体的既有规则）；移动端映射到现有的
+   * jianzhi:mobile-open-panel（detail 带 route），不支持移动端时提示。面板不存在或不可见时提示并返回 false。
+   */
+  const openPanelWithRoute = useCallback((panelId: string, route: string | null): boolean => {
+    const target = sidebarPanels.find(p => p.id === panelId);
+    if (!target) {
+      if (isMobile) {
+        window.dispatchEvent(new CustomEvent('jianzhi:mobile-notice', { detail: { text: '无权访问或面板不存在' } }));
+      } else {
+        toast.error('无权访问或面板不存在');
+      }
+      return false;
     }
-  }, [sidebarPanels]);
+    if (isMobile) {
+      if (target.mobile?.supported) {
+        window.dispatchEvent(new CustomEvent('jianzhi:mobile-open-panel', { detail: { panelId: target.id, route } }));
+      } else {
+        window.dispatchEvent(new CustomEvent('jianzhi:mobile-notice', {
+          detail: { text: `「${target.name}」暂不支持移动端` } }));
+      }
+      return true;
+    }
+    if (target.category === 'third_party') {
+      setPanelRoutes(prev => (prev[target.id] === route ? prev : { ...prev, [target.id]: route }));
+    }
+    handleNavigate(target.id);
+    return true;
+  }, [sidebarPanels, isMobile, handleNavigate]);
+
+  // MC06：地址栏同步（只用 replaceState，后退键行为不变）。打开三方面板时写 ?panel=&r=，切到内置面板或聊天时移除。
+  // 须声明在首次解析之前：解析完成的同一轮提交里本效果先跑、仍处于未解析状态，不会抢先清掉地址栏参数
+  useEffect(() => {
+    if (!deepLinkDoneRef.current || isMobile || typeof window === 'undefined') return;
+    const type = activePanelId;
+    const panel = type ? sidebarPanels.find(p => p.id === type) : undefined;
+    const link = panel && panel.category === 'third_party'
+      ? { panelId: panel.id, route: panelRoutes[panel.id] ?? null }
+      : null;
+    const next = applyDeepLink(window.location.search, link);
+    if (next !== window.location.search) {
+      window.history.replaceState(window.history.state, '', `${window.location.pathname}${next}${window.location.hash}`);
+    }
+  }, [activePanelId, panelRoutes, sidebarPanels, isMobile]);
+
+  // MC06：首个面板列表到达后解析一次地址栏深链；面板不存在或不可见时提示并移除参数。
+  // 移动端不做地址栏同步，打开后也移除参数，避免之后地址栏停留在过期的面板与路由上
+  useEffect(() => {
+    if (deepLinkDoneRef.current || !sidebarLoaded || typeof window === 'undefined') return;
+    deepLinkDoneRef.current = true;
+    const search = window.location.search;
+    const link = parseDeepLink(search);
+    // 地址栏是外部状态，只在面板列表首次到达时读一次，这里打开面板属于有意为之
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    const opened = link ? openPanelWithRoute(link.panelId, link.route) : false;
+    if ((!opened || isMobile) && /(^|[?&])(panel|r)=/.test(search)) {
+      window.history.replaceState(window.history.state, '', `${window.location.pathname}${applyDeepLink(search, null)}${window.location.hash}`);
+    }
+  }, [sidebarLoaded, openPanelWithRoute, isMobile]);
+
+  // MC06：面板经 sdk.nav.open 请求打开另一个面板
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<OpenPanelDetail>).detail;
+      if (!detail?.panelId) return;
+      openPanelWithRoute(detail.panelId, detail.route ?? null);
+    };
+    window.addEventListener(OPEN_PANEL_EVENT, handler);
+    return () => window.removeEventListener(OPEN_PANEL_EVENT, handler);
+  }, [openPanelWithRoute]);
 
   // Listen for agent UI control actions (ABC framework)
   useEffect(() => {
@@ -509,8 +586,8 @@ export default function Home() {
       if (isMobile && (actionType === 'form_fill' || actionType === 'ui_hook')) return;
       switch (actionType) {
         case 'navigate':
-          // Agent-triggered navigate: open panel but do NOT switch agent
-          handleNavigateOnly(actionData.target);
+          // 需求5：目标面板已打开→激活为当前；未打开→打开并激活（绑定智能体随面板切换）
+          activatePanel(actionData.target);
           break;
         case 'switch_agent':
           handleAgentSelect(actionData.target);
@@ -522,7 +599,7 @@ export default function Home() {
           window.open(actionData.target, '_blank');
           break;
         case 'form_fill':
-          handleNavigateOnly(actionData.target);
+          activatePanel(actionData.target);
           setTimeout(() => {
             if (actionData.click && actionData.fields) {
               fillForm(actionData.click, actionData.fields);
@@ -531,7 +608,7 @@ export default function Home() {
           break;
         case 'ui_hook':
           // Agent → Panel directed communication: navigate to panel, then dispatch hook
-          if (actionData.panel) handleNavigateOnly(actionData.panel);
+          if (actionData.panel) activatePanel(actionData.panel);
           setTimeout(() => {
             window.dispatchEvent(new CustomEvent('jianzhi:ui-hook', { detail: actionData }));
           }, 300);
@@ -540,7 +617,7 @@ export default function Home() {
     };
     window.addEventListener('jianzhi:agent-action', handler);
     return () => window.removeEventListener('jianzhi:agent-action', handler);
-  }, [handleNavigateOnly, handleAgentSelect, isMobile, sidebarPanels]);
+  }, [activatePanel, handleAgentSelect, isMobile, sidebarPanels]);
 
   // Draggable divider between content panel and chat panel
   const handleDividerMouseDown = useCallback((e: React.MouseEvent) => {
@@ -572,7 +649,7 @@ export default function Home() {
 
   const handleClearAgent = useCallback(() => {
     setActiveAgent('main');
-    setContentPanel(null);
+    setActivePanelId(null);  // 只回对话，不卸载已打开的面板
   }, []);
 
 
@@ -599,8 +676,8 @@ export default function Home() {
   if (!user) return <LoginPage onLogin={login} />;
   if (!forcePwDone && user.passwordChanged === false) return <ForcePasswordChange userId={user.id} token={token!} onComplete={() => setForcePwDone(true)} />;
 
-  const isAside = contentPanel !== null && !expanded;
-  const isFloating = contentPanel !== null && expanded;
+  const isAside = activePanelId !== null && !expanded;
+  const isFloating = activePanelId !== null && expanded;
 
   // License overlays shared by desktop & mobile shells
   const licenseOverlays = (
@@ -767,48 +844,69 @@ export default function Home() {
         <ConfigGuideBanner token={token!} onNavigate={(panel) => { handleNavigate(panel); setNeedsGuidedConfig(false); }} />
       )}
       <div className="flex flex-1 min-h-0">
-      <Sidebar active={activeNav} onNavigate={handleNavigate} panels={sidebarPanels} onCustomize={() => setShowCustomize(true)} />
+      <Sidebar active={activePanelId ?? 'chat'} onNavigate={handleNavigate} panels={sidebarPanels} onCustomize={() => setShowCustomize(true)} />
 
       <div className="flex flex-1 overflow-hidden relative">
-        {/* Content area — keep-alive: visited panels stay mounted, hidden via CSS */}
-        {contentPanel && (
+        {/* Content area — keep-alive: open panels stay mounted, hidden via CSS; tabs switch active */}
+        {activePanelId && (
           <div className="flex-1 flex flex-col bg-white min-w-0">
-            <div className="h-11 bg-white border-b border-gray-200 flex items-center px-4 gap-2 shrink-0">
-              <button onClick={() => { setContentPanel(null); setExpanded(false); setShowFloating(false); if (activeAgent === 'skill_builder') handleClearAgent(); }} className="text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded px-1.5 py-0.5">✕</button>
-              {contentPanel.icon?.startsWith('img:') && <img src={contentPanel.icon.slice(4)} alt="" width={18} height={18} className="rounded-sm object-cover" />}
-              <span className="text-sm font-medium">{contentPanel.title}</span>
+            <div className="h-11 bg-white border-b border-gray-200 flex items-center px-2 gap-1 shrink-0 overflow-x-auto">
+              {openPanels.map(id => {
+                const p = sidebarPanels.find(sp => sp.id === id);
+                const isActive = id === activePanelId;
+                return (
+                  <div
+                    key={id}
+                    onClick={() => activatePanel(id)}
+                    className={`flex items-center gap-1.5 pl-2.5 pr-1 py-1 rounded-md text-sm cursor-pointer shrink-0 select-none ${
+                      isActive ? 'bg-indigo-50 text-indigo-600 font-medium' : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700'
+                    }`}
+                  >
+                    {p?.icon?.startsWith('img:') ? (
+                      <img src={p.icon.slice(4)} alt="" width={15} height={15} className="rounded-sm object-cover" />
+                    ) : p?.icon && !p.icon.includes(':') ? (
+                      <span className="text-xs leading-none">{p.icon}</span>
+                    ) : null}
+                    <span className="whitespace-nowrap">{p?.name ?? id}</span>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); closePanel(id); }}
+                      className="text-gray-400 hover:text-gray-600 hover:bg-gray-200/70 rounded px-1 py-0.5 text-xs leading-none"
+                    >✕</button>
+                  </div>
+                );
+              })}
               <div className="flex-1" />
               <button
                 onClick={() => { setExpanded(!expanded); setShowFloating(false); }}
-                className="text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded px-1.5 py-0.5 text-sm"
+                className="text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded px-1.5 py-0.5 text-sm shrink-0"
                 title={expanded ? t('user.showChat') : t('user.expandFull')}
               >{expanded ? '◧' : '⛶'}</button>
             </div>
             <div className="flex-1 overflow-hidden relative min-h-0">
-              {visitedPanels.has('cfg') && <div className={contentPanel.type === 'cfg' ? 'h-full' : 'hidden'}><SettingsPanel /></div>}
-              {visitedPanels.has('cw') && <div className={contentPanel.type === 'cw' ? 'h-full' : 'hidden'}><CoWorkerPanel /></div>}
-              {visitedPanels.has('skills') && <div className={contentPanel.type === 'skills' ? 'h-full' : 'hidden'}><SkillsManagePanel messages={messages} onOpenSession={(_skillName, sid, agentType) => {
+              {openPanels.includes('cfg') && <div className={activePanelId === 'cfg' ? 'h-full' : 'hidden'}><SettingsPanel /></div>}
+              {openPanels.includes('cw') && <div className={activePanelId === 'cw' ? 'h-full' : 'hidden'}><CoWorkerPanel /></div>}
+              {openPanels.includes('skills') && <div className={activePanelId === 'skills' ? 'h-full' : 'hidden'}><SkillsManagePanel messages={messages} onOpenSession={(_skillName, sid, agentType) => {
                 setActiveAgent(agentType);
                 setChatStarted(true);
                 if (sid) loadSession(sid);
               }} /></div>}
-              {visitedPanels.has('connectors') && <div className={contentPanel.type === 'connectors' ? 'h-full' : 'hidden'}><ConnectorsPanel onOpenSession={(_name, sid, agentType) => {
+              {openPanels.includes('connectors') && <div className={activePanelId === 'connectors' ? 'h-full' : 'hidden'}><ConnectorsPanel onOpenSession={(_name, sid, agentType) => {
                 setActiveAgent(agentType);
                 setChatStarted(true);
                 if (sid) loadSession(sid);
               }} /></div>}
-              {visitedPanels.has('dashboard') && <div className={contentPanel.type === 'dashboard' ? 'h-full' : 'hidden'}><CustomDashboardPanel token={token} onOpenSession={(_name, sid, agentType) => {
+              {openPanels.includes('dashboard') && <div className={activePanelId === 'dashboard' ? 'h-full' : 'hidden'}><CustomDashboardPanel token={token} onOpenSession={(_name, sid, agentType) => {
                 setActiveAgent(agentType);
                 setChatStarted(true);
                 if (sid) loadSession(sid);
               }} onActivePdfChange={setActivePdfFileId} /></div>}
-              {visitedPanels.has('agents') && <div className={contentPanel.type === 'agents' ? 'h-full' : 'hidden'}><AgentManagerPanel /></div>}
-              {/* Third-party extension panels — on-demand mount (keepAlive=false) */}
+              {openPanels.includes('agents') && <div className={activePanelId === 'agents' ? 'h-full' : 'hidden'}><AgentManagerPanel /></div>}
+              {/* Third-party extension panels — keepAlive 面板随 openPanels 常驻，其余仅激活时挂载 */}
               {sidebarPanels
                 .filter(p => p.category === 'third_party' && p.sourceAppId && p.entryComponent &&
-                  (contentPanel?.type === p.id || (p as any).keepAlive && visitedPanels.has(p.id)))
+                  (activePanelId === p.id || (p as any).keepAlive && openPanels.includes(p.id)))
                 .map(p => (
-                  <div key={p.id} className={contentPanel?.type === p.id ? 'h-full' : 'hidden'}>
+                  <div key={p.id} className={activePanelId === p.id ? 'h-full' : 'hidden'}>
                     <DynamicPanelLoader
                       panel={{
                         id: p.id,
@@ -824,6 +922,10 @@ export default function Home() {
                         { id: p.id, sourceAppId: p.sourceAppId, agentId: p.agentId },
                         msg,
                       )}
+                      route={panelRoutes[p.id] ?? null}
+                      onRouteChange={nextRoute => setPanelRoutes(prev => (
+                        prev[p.id] === nextRoute ? prev : { ...prev, [p.id]: nextRoute }
+                      ))}
                     />
                   </div>
                 ))}
@@ -917,6 +1019,9 @@ export default function Home() {
             )}
             <div className="mr-2">
               <MobileAccessQr url={mobileAccessUrl} />
+            </div>
+            <div className="mr-2">
+              <InboxBell token={token} />
             </div>
             <div className="relative group">
               <div className="w-8 h-8 rounded-full bg-indigo-600 text-white flex items-center justify-center text-xs font-semibold cursor-pointer">

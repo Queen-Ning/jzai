@@ -45,7 +45,7 @@ function makeCtx(apps: any[]) {
 }
 
 const THIRD_PARTY = { appId: 'tp1', status: 'active', manifest: { backend: { toolProviders: [{ mcpExposed: true, toolIds: ['t_a', 't_b'] }] } } };
-const FIRST_PARTY = { appId: 'fp1', status: 'active', manifest: { platformCapabilities: ['appstore:manage'], backend: { toolProviders: [{ mcpExposed: true, toolIds: ['jd_x'] }] } } };
+const FIRST_PARTY = { appId: 'io.jzai.fp1', status: 'active', manifest: { appId: 'io.jzai.fp1', platformCapabilities: ['appstore:manage'], backend: { toolProviders: [{ mcpExposed: true, toolIds: ['jd_x'] }] } } };
 
 describe('T3.1 AppMcpExposeService', () => {
   it('用例1：未审批 false → setAllowed 后 true 且记录 approved_by/at', async () => {
@@ -65,11 +65,24 @@ describe('T3.1 AppMcpExposeService', () => {
 
   it('用例2：首方 APP 无表行也恒 true；非 active 恒 false', async () => {
     const { svc } = makeCtx([FIRST_PARTY]);
-    await expect(svc.isAllowed('fp1')).resolves.toBe(true);
+    await expect(svc.isAllowed('io.jzai.fp1')).resolves.toBe(true);
     const inactive = { ...THIRD_PARTY, appId: 'off1', status: 'inactive' };
     const c2 = makeCtx([inactive]);
     await c2.svc.setAllowed('off1', true, 'admin1'); // 可记录但运行期仍 false
     await expect(c2.svc.isAllowed('off1')).resolves.toBe(false);
+  });
+
+  // T-P-18 补修（MC11）：授权只读期内照常暴露，只读期满后不再暴露
+  it('授权只读期内的 APP 照常暴露并列出；只读期满后不暴露也不列出', async () => {
+    const future = new Date(Date.now() + 86_400_000).toISOString();
+    const past = new Date(Date.now() - 1_000).toISOString();
+    const readonly = { ...FIRST_PARTY, status: 'license_expired', licenseReadonlyUntil: future };
+    const ended = { ...THIRD_PARTY, appId: 'tp_end', status: 'license_expired', licenseReadonlyUntil: past };
+    const { svc } = makeCtx([readonly, ended]);
+    await svc.setAllowed('tp_end', true, 'admin1');
+    await expect(svc.isAllowed('io.jzai.fp1')).resolves.toBe(true);
+    await expect(svc.isAllowed('tp_end')).resolves.toBe(false);
+    expect((await svc.listDeclared()).map(d => d.appId)).toEqual(['io.jzai.fp1']);
   });
 
   it('用例4：listDeclared 返回声明 mcpExposed 的 active APP 及审批状态', async () => {
@@ -77,10 +90,10 @@ describe('T3.1 AppMcpExposeService', () => {
       { appId: 'none1', status: 'active', manifest: { backend: { toolProviders: [{ toolIds: ['x'] }] } } }]);
     await svc.setAllowed('tp1', true, 'admin1');
     const list = await svc.listDeclared();
-    expect(list.map(d => d.appId).sort()).toEqual(['fp1', 'tp1']); // 未声明者 excluded
+    expect(list.map(d => d.appId).sort()).toEqual(['io.jzai.fp1', 'tp1']); // 未声明者 excluded
     const tp = list.find(d => d.appId === 'tp1')!;
     expect(tp).toMatchObject({ allowed: true, approvedBy: 'admin1', firstParty: false, toolIds: ['t_a', 't_b'] });
-    expect(list.find(d => d.appId === 'fp1')).toMatchObject({ allowed: true, firstParty: true });
+    expect(list.find(d => d.appId === 'io.jzai.fp1')).toMatchObject({ allowed: true, firstParty: true });
   });
 
   it('setAllowed 对不存在 APP → 404', async () => {
@@ -89,7 +102,10 @@ describe('T3.1 AppMcpExposeService', () => {
   });
 
   it('isFirstPartyApp 判定', () => {
-    expect(isFirstPartyApp({ platformCapabilities: ['appstore:manage'] })).toBe(true);
+    expect(isFirstPartyApp({ appId: 'io.jzai.x', platformCapabilities: ['appstore:manage'] })).toBe(true);
+    // MC10：旧号或第三方号即使声明 appstore:manage 也不是首方
+    expect(isFirstPartyApp({ appId: 'com.jianzhi.x', platformCapabilities: ['appstore:manage'] })).toBe(false);
+    expect(isFirstPartyApp({ appId: 'com.acme.x', platformCapabilities: ['appstore:manage'] })).toBe(false);
     expect(isFirstPartyApp({ platformCapabilities: ['connections'] })).toBe(false);
     expect(isFirstPartyApp({})).toBe(false);
   });

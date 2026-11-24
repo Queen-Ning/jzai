@@ -16,8 +16,8 @@ const warn = (msg: string) => console.warn(`[InitDB] ${msg}`);
 // ── Seed data (must match service defaults) ───────────────────────────────
 
 const SEED_ROLES = [
-  { id: 'admin', name: '管理员', description: '拥有系统全部权限', permissions: ['chat:use','chat:coworker','kb:read','kb:write','kb:review','cw:view','cw:manage','cw:build','dash:view','dash:view_all','cfg:model','cfg:automation','cfg:users','sys:admin'], isSystem: true },
-  { id: 'user', name: '普通用户', description: '使用对话、查看企业心智、查看个人看板', permissions: ['chat:use','chat:coworker','kb:read','dash:view'], isSystem: true },
+  { id: 'admin', name: '管理员', description: '拥有系统全部权限', permissions: ['chat:use','kb:read','kb:write','cw:view','cw:manage','cw:build','dash:view','dash:view_all','cfg:users','cfg:model','cfg:tools','cfg:timer','cfg:analytics','cfg:oem','cfg:appPerms','cfg:general','nav:skills','nav:connectors','nav:agents','nav:apps','nav:dashboard','nav:settings','sys:admin'], isSystem: true },
+  { id: 'user', name: '普通用户', description: '使用对话、浏览知识库、查看数据仪表与应用', permissions: ['chat:use','kb:read','dash:view','nav:apps','nav:dashboard'], isSystem: true },
 ];
 
 const SEED_PANELS = [

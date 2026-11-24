@@ -20,7 +20,7 @@
  * - 运行期：poller 周期性探测，失败→degraded（工具/invoke 入口拒绝，APP_SERVICE_UNHEALTHY）
  *   →按指数退避重启（maxRestarts 上限）→恢复→healthy；连续失败耗尽后保持 degraded。
  */
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { spawn, ChildProcess, execFile } from 'child_process';
 import { promisify } from 'util';
 import * as net from 'net';
@@ -28,6 +28,16 @@ import * as path from 'path';
 import { DbService } from '../../../db/db.service';
 import { AppLogService } from '../services/app-log.service';
 import { AppManifest } from '../validators/manifest.schema';
+import { DEFAULT_MAX_RESTARTS, canRestart, restartBackoffMs } from './supervision';
+
+/** 独立进程后端（MC09）的健康与状态来源：由 ProcessRuntimeService 实现，避免本类依赖它的具体实现 */
+export interface BackendProcessStatusSource {
+  isDegraded(appId: string): { degraded: boolean; reason?: string };
+  listStatus(appId: string): CompanionStatus[];
+}
+
+/** DI 令牌：ProcessRuntimeService 以此名提供 BackendProcessStatusSource */
+export const BACKEND_PROCESS_STATUS = 'BACKEND_PROCESS_STATUS';
 
 const execFileAsync = promisify(execFile);
 
@@ -40,6 +50,9 @@ export interface CompanionStatus {
   detail?: string;
   endpoint?: string;
   restarts: number;
+  /** 独立进程后端（serviceId 'backend'）附带的进程信息 */
+  pid?: number;
+  rssMb?: number;
 }
 
 interface Handle {
@@ -84,6 +97,8 @@ export class CompanionServiceManager {
   constructor(
     private readonly db: DbService,
     private readonly logBuffer: AppLogService,
+    // MC09：独立进程后端的降级状态并入同一守卫，invoke 与 ToolBridge 无需另接
+    @Optional() @Inject(BACKEND_PROCESS_STATUS) private readonly backendProcesses?: BackendProcessStatusSource,
   ) {}
 
   /** 激活入口：拉起全部声明服务（任一失败→回滚已拉起者并抛错），返回 config 注入值 */
@@ -121,6 +136,8 @@ export class CompanionServiceManager {
 
   /** 工具/invoke 守卫：运行期健康丢失 → degraded */
   isDegraded(appId: string): { degraded: boolean; reason?: string } {
+    const backend = this.backendProcesses?.isDegraded(appId);
+    if (backend?.degraded) return backend;
     for (const h of this.handles.values()) {
       if (h.appId === appId && h.status === 'degraded') {
         return { degraded: true, reason: `伴随服务 ${h.decl.id} 不健康：${h.detail ?? '未知原因'}` };
@@ -130,12 +147,13 @@ export class CompanionServiceManager {
   }
 
   listServices(appId: string): CompanionStatus[] {
-    return [...this.handles.values()]
+    const companions = [...this.handles.values()]
       .filter(h => h.appId === appId)
       .map(h => ({
         serviceId: h.decl.id, runtime: h.decl.runtime, status: h.status,
         detail: h.detail, endpoint: h.endpoint, restarts: h.restarts,
       }));
+    return [...(this.backendProcesses?.listStatus(appId) ?? []), ...companions];
   }
 
   // ────────────────────────── 启动 ──────────────────────────
@@ -396,8 +414,8 @@ export class CompanionServiceManager {
 
   private async attemptRestart(h: Handle, reason: string): Promise<void> {
     if (h.restarting || h.stopping) return;
-    const max = h.decl.maxRestarts ?? 5;
-    if (h.restarts >= max) {
+    const max = h.decl.maxRestarts ?? DEFAULT_MAX_RESTARTS;
+    if (!canRestart(h.restarts, max)) {
       if (h.restarts === max) {
         h.restarts++;
         await this.emit(h, 'restart_exhausted', { maxRestarts: max, reason });
@@ -407,7 +425,7 @@ export class CompanionServiceManager {
     }
     h.restarting = true;
     h.restarts++;
-    const backoffMs = Math.min(1000 * 2 ** (h.restarts - 1), 30000);
+    const backoffMs = restartBackoffMs(h.restarts);
     await new Promise(res => setTimeout(res, backoffMs));
     try {
       await this.emit(h, 'restarting', { attempt: h.restarts, reason });

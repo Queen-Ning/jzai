@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { useI18n } from '@/i18n';
 import { getMainUrl } from '@/lib/env';
 import type { SidebarPanel } from '@/hooks/useSidebar';
-import { useAppEntries, appEntryPanelTitle, appDisplayName } from '@/hooks/useAppEntries';
+import { useAppEntries, appEntryPanelTitle, appDisplayName, appEntryDescription, appReadonlyHint } from '@/hooks/useAppEntries';
 
 const MAIN_URL = getMainUrl();
 
@@ -34,7 +34,7 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
   const [openGroup, setOpenGroup] = useState<string | null>(null);
   const [popoverPos, setPopoverPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
   const [appMenuOpen, setAppMenuOpen] = useState(false);
-  const [appMenuPos, setAppMenuPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
+  const [appMenuPos, setAppMenuPos] = useState<{ top: number; left: number; anchorBottom: number }>({ top: 0, left: 0, anchorBottom: 0 });
   const { apps: installedApps } = useAppEntries();
   const popoverRef = useRef<HTMLDivElement>(null);
   const appMenuRef = useRef<HTMLDivElement>(null);
@@ -60,6 +60,18 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [openGroup, appMenuOpen]);
+
+  // 应用菜单自适应：宽高由内容撑开（上限为内容区尺寸，见弹出层 style）；
+  // 弹出层以底部与「应用」按钮对齐（top = 按钮底边 − 实际高度）；内容过高时
+  // 顶部贴内容区上缘、向下延伸。内容变化（应用异步加载）时重新定位。
+  useEffect(() => {
+    if (!appMenuOpen || !appMenuRef.current) return;
+    const height = appMenuRef.current.offsetHeight;
+    setAppMenuPos(pos => {
+      const top = Math.max(8, pos.anchorBottom - height);
+      return top !== pos.top ? { ...pos, top } : pos;
+    });
+  }, [appMenuOpen, installedApps.length]);
 
   const visiblePanels = panels.filter(p => p.visible && p.id !== 'cfg');
   const cfgPanel = panels.find(p => p.id === 'cfg');
@@ -111,14 +123,14 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
   const groupHasActive = (g: { items: SidebarPanel[] }) => g.items.some(p => active === p.id);
 
   return (
-    <div className="w-[68px] bg-white border-r border-gray-200 flex flex-col shrink-0 select-none relative z-40">
-      {/* Logo → chat */}
+    <div className="w-[54px] bg-white border-r border-gray-200 flex flex-col shrink-0 select-none relative z-40">
+      {/* Logo → 关闭全部面板，回全屏对话页 */}
       <div className="py-3 flex justify-center border-b border-gray-200 cursor-pointer" onClick={() => onNavigate('chat')}>
         <img src="/logo.png" alt={t('nav.brand')} className="w-9 h-9 object-contain" />
       </div>
 
       <nav className="flex-1 flex flex-col gap-1 p-1.5 pt-3 overflow-y-auto">
-        {/* Chat — always first */}
+        {/* Chat — always first（关闭全部面板、回全屏对话页） */}
         <button onClick={() => onNavigate('chat')} className={btnClass(active === 'chat')}>
           <span className="text-xl leading-none"><PanelIcon icon="img:/icons/chat.svg" /></span>
           {t('nav.chat')}
@@ -176,10 +188,8 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
               onClick={(e) => {
                 if (appMenuOpen) { setAppMenuOpen(false); return; }
                 const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                // 按视口高度钳制 top，保证弹出层完整显示（弹出层 max-h 70vh）
-                const menuMaxHeight = Math.round(window.innerHeight * 0.7);
-                const top = Math.max(8, Math.min(rect.top, window.innerHeight - menuMaxHeight - 8));
-                setAppMenuPos({ top, left: rect.right + 4 });
+                // 初始先放在按钮处；打开后由上方 effect 按实际高度把底部对齐到按钮底边
+                setAppMenuPos({ top: rect.top, left: rect.right + 4, anchorBottom: rect.bottom });
                 setAppMenuOpen(true);
               }}
               className={btnClass(appMenuOpen)}
@@ -192,21 +202,33 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
 
         {appMenuOpen && (() => {
           const activeApps = installedApps;
-          const panelTitle = (p: { id: string; name?: { zh?: string; en?: string } }) => appEntryPanelTitle(p as any, locale);
+          const panelTitle = (p: { id: string; name?: { zh?: string; en?: string } }) => appEntryPanelTitle(p, locale);
           return (
-            <div ref={appMenuRef} className="fixed bg-white border border-gray-200 rounded-xl shadow-xl z-50 p-3 w-[520px] max-w-[90vw] max-h-[70vh] overflow-y-auto"
-              style={{ top: appMenuPos.top, left: appMenuPos.left }}>
+            <div ref={appMenuRef} className="fixed bg-white border border-gray-200 rounded-xl shadow-xl z-50 p-3 w-auto min-w-[280px] overflow-y-auto"
+              style={{
+                top: appMenuPos.top,
+                left: appMenuPos.left,
+                // 尺寸随内容撑开，但不超出内容区（弹出层 left 起至视口右缘，留 8px 边距）；
+                // 最多四列：4×卡片最小宽 210 + 3×间距 10 + 2×内边距 12，第 5 张卡片起换行；高度超出时滚动
+                maxWidth: Math.min(window.innerWidth - appMenuPos.left - 8, 4 * 210 + 3 * 10 + 2 * 12),
+                maxHeight: window.innerHeight - 16,
+              }}>
               <div className="text-[10px] text-gray-400 px-1 pb-2">{panelName(appsPanel!)}</div>
               {activeApps.length === 0 ? (
-                <div className="px-3 py-2 text-xs text-gray-400">暂无已安装应用</div>
+                <div className="px-3 py-2 text-xs text-gray-400">暂无可用的应用</div>
               ) : (
                 <div className="flex flex-wrap gap-2.5">
-                  {activeApps.map(app => (
+                  {activeApps.map(app => {
+                    const readonlyHint = appReadonlyHint(app);
+                    return (
                     <div key={app.appId} className="flex-1 min-w-[210px] max-w-full bg-white border border-gray-200 rounded-lg p-2.5">
-                      {/* APP 分组头（灰底标题区） */}
+                      {/* APP 分组头（灰底标题区）；MC12：授权只读期内显示「只读」标记 */}
                       <div className="flex items-baseline gap-1.5 -mx-2.5 -mt-2.5 px-3.5 py-2 mb-1.5 bg-gray-50 border-b border-gray-200 rounded-t-lg" title={app.appId}>
                         <span className="text-xs font-semibold text-gray-800 truncate">{appDisplayName(app.name, app.appId)}</span>
                         <span className="text-[10px] text-gray-400 shrink-0">v{app.version}</span>
+                        {readonlyHint && (
+                          <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-1 shrink-0" title={readonlyHint}>只读</span>
+                        )}
                       </div>
                       {/* 功能入口（一个 APP 可多个） */}
                       <div className="flex flex-wrap gap-1">
@@ -217,7 +239,7 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
                             className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-sm hover:bg-gray-100 transition-all ${
                               active === panel.id ? 'text-indigo-600 bg-gray-100' : 'text-gray-600'
                             }`}
-                            title={panel.description || app.description}
+                            title={appEntryDescription(app, locale)}
                           >
                             <span className="shrink-0"><PanelIcon icon={panel.icon || '📦'} size={16} /></span>
                             <span className="truncate max-w-[140px]">{panelTitle(panel)}</span>
@@ -225,7 +247,8 @@ export default function Sidebar({ active, onNavigate, panels, onCustomize }: Sid
                         ))}
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>

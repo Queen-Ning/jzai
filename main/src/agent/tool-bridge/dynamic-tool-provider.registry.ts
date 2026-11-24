@@ -34,6 +34,18 @@ export class DynamicToolProviderRegistry {
     return this.draining.has(appId);
   }
 
+  /** MC11：授权到期且不在只读期的 APP；ToolBridge 据此返回 APP_LICENSE_EXPIRED（与停用并行生效，不随 unregister 清除） */
+  private readonly licenseBlocked = new Set<string>();
+
+  setLicenseBlocked(appId: string, blocked: boolean): void {
+    if (blocked) this.licenseBlocked.add(appId);
+    else this.licenseBlocked.delete(appId);
+  }
+
+  isLicenseBlocked(appId: string): boolean {
+    return this.licenseBlocked.has(appId);
+  }
+
   register(appId: string, providers: ToolProvider[], tokenLimits: TokenLimitMap = {}): void {
     const registered: RegisteredProvider[] = [];
     for (const provider of providers) {

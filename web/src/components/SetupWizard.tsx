@@ -142,7 +142,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
         <div className="bg-white rounded-2xl shadow-lg border border-gray-200 p-10 text-center max-w-md">
           <div className="text-5xl mb-4">🎉</div>
           <h2 className="text-xl font-bold text-gray-900 mb-2">注册成功</h2>
-          <p className="text-gray-500 mb-2">欢迎使用见智·企业AI</p>
+          <p className="text-gray-500 mb-2">欢迎使用荐智·企业AI</p>
           <p className="text-sm text-gray-400 mb-6">{companyName}</p>
           <button
             onClick={onComplete}
@@ -166,7 +166,7 @@ export default function SetupWizard({ onComplete }: SetupWizardProps) {
             <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-indigo-700 flex items-center justify-center shadow-sm">
               <span className="text-white font-bold">JZ</span>
             </div>
-            <span className="text-xl font-bold text-gray-900">见智</span>
+            <span className="text-xl font-bold text-gray-900">荐智</span>
           </div>
           <h1 className="text-lg font-bold text-gray-900 mb-1">
             {step === 'form' ? '企业注册' : '验证手机号'}

@@ -1,4 +1,4 @@
-import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, Optional, BadRequestException } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -29,14 +29,15 @@ import { AppValidatorService } from '../validators/app-validator.service';
 import { AppRegistryService } from './app-registry.service';
 import { AppSchemaService } from './app-schema.service';
 import { AppMigrationService } from './app-migration.service';
-import { AppPoolService } from './app-pool.service';
+import { AppPoolService, parentPoolMax } from './app-pool.service';
 import { AppActivationService } from './app-activation.service';
 import { AppCapabilityService } from './app-capability.service';
 import { AppCredentialService } from './app-credential.service';
 import { AppLicenseService } from './app-license.service';
+import { AppLicenseRuntimeService } from './app-license-runtime.service';
 import { SafeArchiveService } from './safe-archive.service';
 import { PackageSignatureService } from './package-signature.service';
-import { FIRST_PARTY_APP_ID } from './app-platform.service';
+import { isFirstPartyAppId } from '../first-party';
 import { emitAppUpdated } from '../runtime/app-events';
 
 export type AppInstallProgressReporter = (
@@ -80,6 +81,7 @@ export class AppInstallService {
     private readonly credentials: AppCredentialService,
     private readonly signatures: PackageSignatureService,
     private readonly appLicenses: AppLicenseService,
+    @Optional() private readonly licenseRuntime?: AppLicenseRuntimeService,
   ) {}
 
   async validatePackage(packagePath: string) {
@@ -144,7 +146,7 @@ export class AppInstallService {
 
     // 包签名验签（install 为最终强制点；stage 已做 fail-fast）
     const sigResult = this.signatures.verifyDirectory(extractDir);
-    const sigCheck = this.signatures.check(sigResult, FIRST_PARTY_APP_ID.test(manifest.appId));
+    const sigCheck = this.signatures.check(sigResult, isFirstPartyAppId(manifest.appId));
     if (!sigCheck.ok) {
       throw new BadRequestException(sigCheck.warning);
     }
@@ -229,7 +231,7 @@ export class AppInstallService {
           ...connection,
           user: this.schema.getRoleName(manifest)!,
           password: rolePassword,
-          max: manifest.database.poolMax ?? 3,
+          max: parentPoolMax(manifest),
         });
         resources.poolCreated = true;
 
@@ -253,6 +255,10 @@ export class AppInstallService {
         }
       }
       await this.registry.updateStatus(manifest.appId, finalStatus);
+      // MC11：未授权的应用不留后端运行（安装时从未有过许可证，不进入只读期）
+      if (finalStatus === 'license_expired') {
+        await this.licenseRuntime?.applyStatus(manifest.appId, 'installing', 'license_expired');
+      }
       emitAppUpdated(manifest.appId, manifest.version);
       this.logger.log(`App ${manifest.appId} installed successfully`);
     } catch (err) {

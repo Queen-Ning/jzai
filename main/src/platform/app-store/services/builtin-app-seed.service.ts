@@ -1,7 +1,11 @@
-import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap, Optional } from '@nestjs/common';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { DbService } from '../../../db/db.service';
+import { RETIRED_FIRST_PARTY_APPS } from '../first-party';
+import { AppAuditService } from './app-audit.service';
+import { AppUninstallService } from './app-uninstall.service';
 import { AppRegistryService } from './app-registry.service';
 import { AppInstallService } from './app-install.service';
 import { AppUpgradeService } from './app-upgrade.service';
@@ -25,6 +29,10 @@ export class BuiltinAppSeedService implements OnApplicationBootstrap {
     private readonly install: AppInstallService,
     private readonly upgrade: AppUpgradeService,
     private readonly archives: SafeArchiveService,
+    // MC10：旧号首方应用退役（可选注入，单测直构时不接线则跳过退役）
+    @Optional() private readonly uninstaller?: AppUninstallService,
+    @Optional() private readonly db?: DbService,
+    @Optional() private readonly audit?: AppAuditService,
   ) {}
 
   onApplicationBootstrap() {
@@ -38,7 +46,9 @@ export class BuiltinAppSeedService implements OnApplicationBootstrap {
     return process.env.BUNDLED_APPS_DIR || path.join(process.cwd(), 'config', 'bundled-apps');
   }
 
-  private async seed(): Promise<void> {
+  async seed(): Promise<void> {
+    // 必须在预装目录检查之前：没有预装目录的实例也要退役旧号（MC10）
+    await this.retireLegacyApps();
     const dir = this.bundledDir();
     if (!fs.existsSync(dir)) return;
     const packages = fs.readdirSync(dir).filter(f => f.endsWith('.jzapp'));
@@ -50,6 +60,33 @@ export class BuiltinAppSeedService implements OnApplicationBootstrap {
         await this.seedOne(pkgPath);
       } catch (err: any) {
         this.logger.warn(`内置 APP ${file} 预装/升级失败（下次启动重试）: ${err.message}`);
+      }
+    }
+  }
+
+  /**
+   * 旧号首方应用退役（MC10）：对 RETIRED_FIRST_PARTY_APPS 中注册表里存在的每一项（任何状态，
+   * 含 uninstalled 与上次失败留下的 failed），以 purgeData 卸载；再删除卸载流程不覆盖的残留
+   * （资源授权、资源元数据、MCP 暴露审批），写审计。单项失败只记日志，下次启动重试。
+   */
+  async retireLegacyApps(): Promise<void> {
+    if (!this.uninstaller) return;
+    for (const appId of RETIRED_FIRST_PARTY_APPS) {
+      try {
+        const existing = await this.registry.findOne(appId);
+        if (!existing) continue;
+        this.logger.log(`退役旧号首方应用 ${appId}（状态 ${existing.status}）…`);
+        await this.uninstaller.uninstall(appId, { purgeData: true });
+        if (this.db) {
+          // jz_app_grants 随注册表记录级联删除；jz_resource_grants 的镜像行没有外键，这里删
+          await this.db.query(`DELETE FROM jz_resource_grants WHERE resource_type = 'app' AND resource_id = $1`, [appId]);
+          await this.db.query(`DELETE FROM jz_resource_meta WHERE resource_type = 'app' AND resource_id = $1`, [appId]);
+          await this.db.query(`DELETE FROM jz_app_mcp_expose WHERE app_id = $1`, [appId]);
+        }
+        await this.audit?.log(appId, 'retire_legacy_first_party', null, { previousStatus: existing.status });
+        this.logger.log(`旧号首方应用 ${appId} 已退役`);
+      } catch (err: any) {
+        this.logger.warn(`旧号首方应用 ${appId} 退役失败（下次启动重试）: ${err.message}`);
       }
     }
   }

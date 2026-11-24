@@ -86,7 +86,7 @@ export default function AdminIndexPage() {
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
         <div className="bg-white rounded-2xl shadow-lg border border-gray-200 p-8 w-full max-w-sm">
           <div className="text-center mb-6">
-            <img src="/logo-64.png" alt="见智" className="w-10 h-10 mx-auto mb-3 object-contain" />
+            <img src="/logo-64.png" alt="荐智" className="w-10 h-10 mx-auto mb-3 object-contain" />
             <h1 className="text-xl font-bold text-gray-900 mb-1">管理后台</h1>
             <p className="text-sm text-gray-500">请输入管理密码</p>
           </div>
@@ -106,10 +106,10 @@ export default function AdminIndexPage() {
       <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
         <div className="text-center mb-12">
           <div className="inline-flex items-center gap-2.5 mb-4">
-            <img src="/logo-64.png" alt="见智" className="w-10 h-10 object-contain" />
+            <img src="/logo-64.png" alt="荐智" className="w-10 h-10 object-contain" />
             <span className="text-2xl font-bold text-gray-900">管理后台</span>
           </div>
-          <p className="text-gray-500">见智平台运营管理</p>
+          <p className="text-gray-500">荐智平台运营管理</p>
         </div>
 
         <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-5">

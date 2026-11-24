@@ -9,8 +9,10 @@ import { useSidebar } from '@/hooks/useSidebar';
 import { useMessageDisplay } from '@/hooks/useMessageDisplay';
 import OemConsolePanel from '@/components/OemConsolePanel';
 import DevMcpCard from '@/components/DevMcpCard';
+import TemporalStatusCard from '@/components/TemporalStatusCard';
 import { useAuth } from '@/hooks/useAuth';
 import GrantEditor from '@/components/authz/GrantEditor';
+import AppPermissionsPanel from '@/components/authz/AppPermissionsPanel';
 import UserManagePanel from '@/components/UserManagePanel';
 import TimerPanel from '@/components/TimerPanel';
 import McpExposePanel from '@/components/McpExposePanel';
@@ -43,7 +45,7 @@ function authHeaders(): Record<string, string> {
 
 export default function SettingsPanel() {
   const { t } = useI18n();
-  const [activeTab, setActiveTab] = useState<'model' | 'toolMgmt' | 'general' | 'credentials' | 'analytics' | 'oem' | 'users' | 'timer'>('model');
+  const [activeTab, setActiveTab] = useState<'model' | 'toolMgmt' | 'general' | 'credentials' | 'analytics' | 'oem' | 'users' | 'appPerms' | 'timer'>('model');
   // Note: 'credentials' tab is hidden from the tab bar but still rendered for backward compatibility
   const [toolsSubTab, setToolsSubTab] = useState<'builtin' | 'custom' | 'mcp' | 'email'>('builtin');
   const [generalSubTab, setGeneralSubTab] = useState<'msgDisplay' | 'license' | 'system' | 'shortcuts'>('msgDisplay');
@@ -83,16 +85,21 @@ export default function SettingsPanel() {
   const [saving, setSaving] = useState(false);
   const token = getToken();
   const { user: authUser } = useAuth();
-  const canManageUsers = (() => {
-    if (!authUser) return false;
-    const perms = typeof authUser.role === 'string' ? [] : (authUser.role?.permissions ?? []);
-    return perms.includes('cfg:users') || perms.includes('sys:admin');
-  })();
   const isSysAdmin = (() => {
     if (!authUser) return false;
     const perms = typeof authUser.role === 'string' ? [] : (authUser.role?.permissions ?? []);
     return perms.includes('sys:admin');
   })();
+  // 设置面板分签授权：sys:admin 直通，否则按 cfg:* 分签权限逐项判定
+  const hasCfg = (p: string) => {
+    if (!authUser) return false;
+    const perms = typeof authUser.role === 'string' ? [] : (authUser.role?.permissions ?? []);
+    return perms.includes('sys:admin') || perms.includes(p);
+  };
+  const TAB_PERMS: Record<string, string> = {
+    model: 'cfg:model', toolMgmt: 'cfg:tools', timer: 'cfg:timer', analytics: 'cfg:analytics',
+    oem: 'cfg:oem', users: 'cfg:users', appPerms: 'cfg:appPerms', general: 'cfg:general',
+  };
   const { shortcuts, save: saveShortcuts, reset: resetShortcuts } = useShortcuts(token);
   const { panels: sidebarPanels } = useSidebar(token);
   const [editItems, setEditItems] = useState<typeof shortcuts | null>(null);
@@ -394,7 +401,7 @@ export default function SettingsPanel() {
   return (
     <div className="p-6 overflow-y-auto h-full">
       <div className="flex gap-2 mb-6">
-        {([['model', t('settings.models')], ['toolMgmt', '工具管理'], ['timer', '定时任务'], ['credentials', '系统凭证'], ['analytics', '运营分析'], ['oem', '三方扩展'], ['users', '用户与组织'], ['general', '系统通用']] as const).filter(([tab]) => tab !== 'credentials' && (tab !== 'users' || canManageUsers) && (tab !== 'timer' || isSysAdmin)).map(([tab, label]) => (
+        {([['model', t('settings.models')], ['toolMgmt', '工具管理'], ['timer', '定时任务'], ['credentials', '系统凭证'], ['analytics', '运营分析'], ['oem', '三方扩展'], ['users', '用户与组织'], ['appPerms', '应用权限'], ['general', '系统通用']] as const).filter(([tab]) => tab !== 'credentials' && hasCfg(TAB_PERMS[tab])).map(([tab, label]) => (
           <button key={tab} onClick={() => {
             setActiveTab(tab);
             if (tab === 'toolMgmt') {
@@ -1289,6 +1296,7 @@ export default function SettingsPanel() {
 
       {generalSubTab === 'system' && (
         <div className="space-y-4">
+          {isSysAdmin && <TemporalStatusCard />}
           <div className="border border-gray-200 rounded-lg p-4">
             <h3 className="text-sm font-semibold mb-1">{t('settings.systemDesc')}</h3>
             <p className="text-xs text-gray-400 mb-4">{t('settings.systemDescSub')}</p>
@@ -1355,7 +1363,7 @@ export default function SettingsPanel() {
         </div>
       )}
 
-      {activeTab === 'timer' && isSysAdmin && (
+      {activeTab === 'timer' && hasCfg('cfg:timer') && (
         <TimerPanel />
       )}
 
@@ -1389,6 +1397,13 @@ export default function SettingsPanel() {
       {activeTab === 'users' && (
         <div className="h-full" data-testid="user-table-wrapper">
           <UserManagePanel embedded />
+        </div>
+      )}
+
+      {/* MC12（T-P-20）：应用权限，仅管理员；接口同样只给管理员 */}
+      {activeTab === 'appPerms' && hasCfg('cfg:appPerms') && (
+        <div className="h-[calc(100%-3.5rem)]">
+          <AppPermissionsPanel />
         </div>
       )}
 

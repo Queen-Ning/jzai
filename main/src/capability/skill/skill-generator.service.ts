@@ -116,7 +116,7 @@ export class SkillGeneratorService {
   }
 
   private buildSystemPrompt(): string {
-    return `你是一个企业自动化系统(见智 JianZhi)的代码生成器。
+    return `你是一个企业自动化系统(荐智 JianZhi)的代码生成器。
 
 你需要生成 handler.ts 文件，该文件在沙盒环境中执行多步骤 API 工作流。
 

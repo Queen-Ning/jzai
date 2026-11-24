@@ -28,6 +28,8 @@ export default function UserManagePanel({ embedded }: { embedded?: boolean }) {
   const [resetPwdCopied, setResetPwdCopied] = useState(false);
   const [showAddRole, setShowAddRole] = useState(false);
   const [editRole, setEditRole] = useState<Role | null>(null);
+  const [baseRoleId, setBaseRoleId] = useState<'user' | 'admin'>('user'); // 新建角色的继承基线
+  const [navSettingsOn, setNavSettingsOn] = useState(false); // 勾选「进入设置面板」才展示分签授权
   const [msg, setMsg] = useState('');
   const [deptsList, setDeptsList] = useState<{ id: string; name: string }[]>([]);
   const [userDeptMap, setUserDeptMap] = useState<Record<string, string>>({}); // userId → deptId
@@ -93,20 +95,17 @@ export default function UserManagePanel({ embedded }: { embedded?: boolean }) {
     e.preventDefault();
     const fd = new FormData(e.currentTarget);
     const perms = allPerms.filter(p => fd.get(`perm_${p.id}`) === 'on').map(p => p.id);
-    if (editRole) {
-      await fetch(`${MAIN_URL}/api/roles/${editRole.id}`, {
-        method: 'PUT', headers: authHeaders(),
-        body: JSON.stringify({ name: fd.get('name'), description: fd.get('desc'), permissions: perms }),
-      });
-      flash('✅ ' + t('common.saved'));
-    } else {
-      await fetch(`${MAIN_URL}/api/roles`, {
-        method: 'POST', headers: authHeaders(),
-        body: JSON.stringify({ name: fd.get('name'), description: fd.get('desc'), permissions: perms }),
-      });
-      flash('✅ ' + t('common.saved'));
-    }
-    setShowAddRole(false); setEditRole(null); load();
+    const res = editRole
+      ? await fetch(`${MAIN_URL}/api/roles/${editRole.id}`, {
+          method: 'PUT', headers: authHeaders(),
+          body: JSON.stringify({ name: fd.get('name'), description: fd.get('desc'), permissions: perms }),
+        })
+      : await fetch(`${MAIN_URL}/api/roles`, {
+          method: 'POST', headers: authHeaders(),
+          body: JSON.stringify({ name: fd.get('name'), description: fd.get('desc'), permissions: perms, baseRoleId: fd.get('baseRoleId') }),
+        });
+    if (res.ok) { flash('✅ ' + t('common.saved')); setShowAddRole(false); setEditRole(null); load(); }
+    else { const d = await res.json().catch(() => ({})); flash(`❌ ${d.message || res.status}`); }
   };
 
   const delRole = async (id: string) => {
@@ -118,7 +117,9 @@ export default function UserManagePanel({ embedded }: { embedded?: boolean }) {
   // Group permissions by module
   const permGroups: Record<string, PermDef[]> = {};
   allPerms.forEach(p => { (permGroups[p.module] = permGroups[p.module] || []).push(p); });
-  const moduleLabels: Record<string, string> = { chat: '对话', kb: '企业心智', cw: 'CoWorker', dash: '看板', cfg: '设置', nav: '导航菜单', sys: '系统' };
+  const moduleLabels: Record<string, string> = { cw: 'AI员工', nav: '导航菜单', cfg: '设置面板分签' };
+  // 新建角色时勾选的基线权限 = 所选内置角色的权限集
+  const basePerms = roles.find(r => r.id === baseRoleId)?.permissions || [];
 
   return (
     <div className={embedded ? 'overflow-y-auto h-full' : 'p-6 overflow-y-auto h-full'}>
@@ -324,7 +325,7 @@ export default function UserManagePanel({ embedded }: { embedded?: boolean }) {
         <div>
           <div className="flex justify-between items-center mb-4">
             <h3 className="text-sm font-semibold">{t('users.roleList', { n: roles.length })}</h3>
-            <button onClick={() => { setEditRole(null); setShowAddRole(true); }} className="px-3 py-1.5 bg-indigo-600 text-white text-xs rounded-lg hover:bg-indigo-700">{t('users.newRole')}</button>
+            <button onClick={() => { setEditRole(null); setBaseRoleId('user'); setNavSettingsOn(false); setShowAddRole(true); }} className="px-3 py-1.5 bg-indigo-600 text-white text-xs rounded-lg hover:bg-indigo-700">{t('users.newRole')}</button>
           </div>
 
           <div className="space-y-3">
@@ -336,7 +337,7 @@ export default function UserManagePanel({ embedded }: { embedded?: boolean }) {
                     {r.isSystem && <span className="ml-2 text-[10px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded">{t('users.system')}</span>}
                   </div>
                   <div className="flex gap-2">
-                    <button onClick={() => { setEditRole(r); setShowAddRole(true); }} className="text-xs text-gray-400 hover:text-gray-600">{t('common.edit')}</button>
+                    {!r.isSystem && <button onClick={() => { setEditRole(r); setNavSettingsOn(r.permissions.includes('nav:settings')); setShowAddRole(true); }} className="text-xs text-gray-400 hover:text-gray-600">{t('common.edit')}</button>}
                     {!r.isSystem && <button onClick={() => delRole(r.id)} className="text-xs text-red-400 hover:text-red-600">{t('common.delete')}</button>}
                   </div>
                 </div>
@@ -359,22 +360,56 @@ export default function UserManagePanel({ embedded }: { embedded?: boolean }) {
                 <div className="space-y-3 mb-4">
                   <div><label className="block text-xs text-gray-500 mb-1">{t('users.roleName')}</label><input name="name" required defaultValue={editRole?.name} className="w-full px-3 py-1.5 border border-gray-200 rounded-lg text-sm outline-none focus:border-indigo-500" /></div>
                   <div><label className="block text-xs text-gray-500 mb-1">{t('common.description')}</label><input name="desc" defaultValue={editRole?.description} className="w-full px-3 py-1.5 border border-gray-200 rounded-lg text-sm outline-none focus:border-indigo-500" /></div>
+                  {!editRole && (
+                    <div>
+                      <label className="block text-xs text-gray-500 mb-1">继承自（内置角色，必选）</label>
+                      <div className="flex gap-3">
+                        {(['user', 'admin'] as const).map(id => (
+                          <label key={id} className="flex items-center gap-1.5 text-xs text-gray-600 cursor-pointer">
+                            <input type="radio" name="baseRoleId" value={id} checked={baseRoleId === id} onChange={() => { setBaseRoleId(id); setNavSettingsOn(roles.find(r => r.id === id)?.permissions.includes('nav:settings') ?? false); }} />
+                            {roles.find(r => r.id === id)?.name || id}
+                          </label>
+                        ))}
+                      </div>
+                      <div className="text-[10px] text-gray-400 mt-1">勾选基线来自所选内置角色，可在此基础上追加或减少</div>
+                    </div>
+                  )}
                 </div>
                 <div className="text-xs font-semibold text-gray-500 mb-2">{t('users.permissions')}</div>
-                <div className="space-y-3">
-                  {Object.entries(permGroups).map(([mod, perms]) => (
+                {/* key 随继承基线变化重挂载，使 defaultChecked 按新基线重算 */}
+                <div className="space-y-3" key={editRole ? editRole.id : baseRoleId}>
+                  {Object.entries(permGroups).filter(([mod]) => mod !== 'cfg').map(([mod, perms]) => (
                     <div key={mod} className="border border-gray-100 rounded-lg p-3">
                       <div className="text-xs font-medium text-gray-600 mb-2">{moduleLabels[mod] || mod}</div>
                       <div className="space-y-1">
-                        {perms.map(p => (
+                        {perms.map(p => p.id === 'nav:settings' ? (
                           <label key={p.id} className="flex items-center gap-2 text-xs text-gray-500 cursor-pointer hover:text-gray-700">
-                            <input type="checkbox" name={`perm_${p.id}`} defaultChecked={editRole?.permissions.includes(p.id)} className="rounded border-gray-300" />
+                            <input type="checkbox" name={`perm_${p.id}`} checked={navSettingsOn} onChange={e => setNavSettingsOn(e.target.checked)} className="rounded border-gray-300" />
+                            {p.label}
+                          </label>
+                        ) : (
+                          <label key={p.id} className="flex items-center gap-2 text-xs text-gray-500 cursor-pointer hover:text-gray-700">
+                            <input type="checkbox" name={`perm_${p.id}`} defaultChecked={editRole ? editRole.permissions.includes(p.id) : basePerms.includes(p.id)} className="rounded border-gray-300" />
                             {p.label}
                           </label>
                         ))}
                       </div>
                     </div>
                   ))}
+                  {/* 勾选「进入设置面板」后按分页签明细授权（未勾选时分签项不渲染、提交时自动剥离） */}
+                  {navSettingsOn && permGroups['cfg'] && (
+                    <div className="border border-indigo-100 bg-indigo-50/40 rounded-lg p-3">
+                      <div className="text-xs font-medium text-gray-600 mb-2">{moduleLabels['cfg']}</div>
+                      <div className="space-y-1">
+                        {permGroups['cfg'].map(p => (
+                          <label key={p.id} className="flex items-center gap-2 text-xs text-gray-500 cursor-pointer hover:text-gray-700">
+                            <input type="checkbox" name={`perm_${p.id}`} defaultChecked={editRole ? editRole.permissions.includes(p.id) : basePerms.includes(p.id)} className="rounded border-gray-300" />
+                            {p.label}
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
                 <div className="flex justify-end gap-2 mt-4">
                   <button type="button" onClick={() => { setShowAddRole(false); setEditRole(null); }} className="px-4 py-1.5 text-xs border border-gray-200 rounded-lg">{t('common.cancel')}</button>

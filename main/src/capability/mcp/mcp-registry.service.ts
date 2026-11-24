@@ -34,6 +34,8 @@ export interface McpServerDef {
   authSystem?: string;        // auth.system from manifest — maps to CredentialService system name
   authScope?: 'global' | 'user'; // auth.scope from manifest — credential resolution scope
   authFields?: AuthFieldDef[]; // auth.fields from manifest — credential form schema
+  /** MC16：隔离插件经 HTTP 桥可用的操作（manifest httpOperations，原样保存；由 sandbox/http-bridge 校验） */
+  httpOperations?: unknown[];
   dirName: string;
   enabled: boolean;
   permissions: ConnectorPermissions;
@@ -94,6 +96,7 @@ export class McpRegistryService {
           authSystem: auth.system || undefined,
           authScope: auth.scope === 'global' ? 'global' : undefined,
           authFields,
+          httpOperations: Array.isArray(m.httpOperations) ? m.httpOperations : undefined,
           dirName: dir.name,
           enabled: m.enabled !== false,
           permissions: m.permissions || {},

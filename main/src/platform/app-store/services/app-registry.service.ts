@@ -19,6 +19,8 @@ export interface InstalledApp {
   installDir?: string;
   licenseBlob?: string | null;
   licenseExpiresAt?: Date | null;
+  /** MC11：授权到期后只读期的截止时间；为空表示不在只读期 */
+  licenseReadonlyUntil?: Date | null;
   packageSha256?: string | null;
   signatureVerified?: boolean;
 }
@@ -27,6 +29,7 @@ const APP_COLUMNS = `id, app_id as "appId", short_name as "shortName", ns_prefix
   version, name, manifest, config, status,
   installed_at as "installedAt", updated_at as "updatedAt", extract_dir as "installDir",
   license_blob as "licenseBlob", license_expires_at as "licenseExpiresAt",
+  license_readonly_until as "licenseReadonlyUntil",
   package_sha256 as "packageSha256", signature_verified as "signatureVerified"`;
 
 @Injectable()
@@ -81,6 +84,14 @@ export class AppRegistryService {
     await this.db.query(
       `UPDATE jz_installed_apps SET status = $1, updated_at = NOW() WHERE app_id = $2`,
       [status, appId],
+    );
+  }
+
+  /** MC11：写入或清除只读期截止时间（null 表示离开只读期） */
+  async updateLicenseReadonlyUntil(appId: string, until: Date | null): Promise<void> {
+    await this.db.query(
+      `UPDATE jz_installed_apps SET license_readonly_until = $1, updated_at = NOW() WHERE app_id = $2`,
+      [until, appId],
     );
   }
 

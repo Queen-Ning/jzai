@@ -6,7 +6,7 @@ import { AppManifest } from '../validators/manifest.schema';
 
 const manifest: AppManifest = {
   manifestVersion: '1.0',
-  appId: 'com.menhu.drawing.dimtuner',
+  appId: 'com.example.drawing.dimtuner',
   shortName: 'dimension-tuner',
   nsPrefix: 'dt',
   name: { zh: '图纸识别' },

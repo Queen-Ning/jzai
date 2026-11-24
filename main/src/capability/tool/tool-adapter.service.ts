@@ -3,6 +3,7 @@ import { ToolProvider, ToolContext, ToolInstance, ToolCatalogEntry } from '../..
 import { ToolRegistryService } from './tool-registry.service';
 import { CredentialService } from '../skill/credential.service';
 import { ConfirmationBridgeService } from '../../agent/support/confirmation-bridge.service';
+import { randomUUID } from 'crypto';
 
 /**
  * ToolAdapterService — dynamically creates tool_* prefixed tools from the tool registry.
@@ -54,7 +55,8 @@ export class ToolAdapterService implements ToolProvider {
           // Confirm gate: if tool has confirm=true, request user confirmation before executing
           // Skip when called from skill handler (no UI to confirm in sandbox)
           if (t.confirm && !skipConfirm) {
-            const confirmId = `${t.name}_${Date.now()}`;
+            // confirmId 带随机后缀：同一毫秒内多个用户调用同一工具时不会互相覆盖挂起项
+            const confirmId = `${t.name}_${Date.now()}_${randomUUID().slice(0, 8)}`;
             try {
               const editedArgs = await this.confirmBridge.requestConfirmation({
                 confirmId,
@@ -63,6 +65,9 @@ export class ToolAdapterService implements ToolProvider {
                 parameters: t.parameters,
                 confirmForm: t.confirmForm,
                 description: t.description,
+                // MC04：确认只归属当前用户与会话
+                userId: userId || undefined,
+                sessionId: ctx.sessionId,
               });
               args = editedArgs;
             } catch (err: any) {

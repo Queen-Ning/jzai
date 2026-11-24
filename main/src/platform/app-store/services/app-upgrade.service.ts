@@ -1,4 +1,4 @@
-import { Injectable, Logger, BadRequestException, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, Optional, BadRequestException, NotFoundException } from '@nestjs/common';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -11,9 +11,10 @@ import { AppMigrationService } from './app-migration.service';
 import { AppPoolService } from './app-pool.service';
 import { AppActivationService } from './app-activation.service';
 import { AppLicenseService } from './app-license.service';
+import { AppLicenseRuntimeService } from './app-license-runtime.service';
 import { SafeArchiveService } from './safe-archive.service';
 import { PackageSignatureService } from './package-signature.service';
-import { FIRST_PARTY_APP_ID } from './app-platform.service';
+import { isFirstPartyAppId } from '../first-party';
 import { copyDirCompat } from './app-install.service';
 import { emitAppUpdated } from '../runtime/app-events';
 
@@ -38,6 +39,7 @@ export class AppUpgradeService {
     private readonly activation: AppActivationService,
     private readonly signatures: PackageSignatureService,
     private readonly appLicenses: AppLicenseService,
+    @Optional() private readonly licenseRuntime?: AppLicenseRuntimeService,
   ) {}
 
   async upgrade(appId: string, packagePath: string, reportProgress?: AppUpgradeProgressReporter): Promise<void> {
@@ -87,7 +89,7 @@ export class AppUpgradeService {
 
       // 包签名验签（与安装同级强制）
       const sigResult = this.signatures.verifyDirectory(extractDir);
-      const sigCheck = this.signatures.check(sigResult, FIRST_PARTY_APP_ID.test(manifest.appId));
+      const sigCheck = this.signatures.check(sigResult, isFirstPartyAppId(manifest.appId));
       if (!sigCheck.ok) {
         throw new BadRequestException(sigCheck.warning);
       }
@@ -153,6 +155,13 @@ export class AppUpgradeService {
           }
         }
         await this.registry.updateStatus(appId, finalStatus);
+        // MC11：升级后仍未授权 → 按策略停用或继续只读期（已有的只读期截止时间不延长）
+        if (finalStatus === 'license_expired') {
+          await this.licenseRuntime?.applyStatus(appId, existing.status, 'license_expired');
+        } else if (existing.status === 'license_expired') {
+          // 只读期内升级且 License 已有效：清除只读期并通知新后端
+          await this.licenseRuntime?.applyStatus(appId, existing.status, 'active');
+        }
         emitAppUpdated(appId, manifest.version);
 
         // 6. 清理旧版本目录（尽力而为，失败不影响升级结果）

@@ -30,7 +30,7 @@ const METRIC_LABELS: Record<string, string> = {
   token_issue: 'Token 签发', chat_msg: '对话消息', widget_refresh: '图表刷新', mcp_query: 'MCP 查询',
 };
 
-const EMBED_HINT = `<script src="<见智域名>/oem/sdk.js"></script>
+const EMBED_HINT = `<script src="<荐智域名>/oem/sdk.js"></script>
 <script>
   // token 由你的后端用 app_id + app_secret 调 POST /api/oem/token 换取
   JianzhiDashboard.embed('#container', { token, view: 'full' });
@@ -240,7 +240,7 @@ function AppForm({ app, users, onCancel, onSave }: {
             <span className="text-xs text-gray-400">主色#</span>
             <input className="inp w-24" value={form.branding?.primary || ''} onChange={e => set({ branding: { ...form.branding, primary: e.target.value } })} placeholder="1677ff" />
             <input className="inp w-40" value={form.branding?.brandName || ''} onChange={e => set({ branding: { ...form.branding, brandName: e.target.value } })} placeholder="品牌名" />
-            <label className="text-xs flex items-center gap-1"><input type="checkbox" checked={!!form.branding?.hideJianzhiMark} onChange={e => set({ branding: { ...form.branding, hideJianzhiMark: e.target.checked } })} />隐藏见智标识</label>
+            <label className="text-xs flex items-center gap-1"><input type="checkbox" checked={!!form.branding?.hideJianzhiMark} onChange={e => set({ branding: { ...form.branding, hideJianzhiMark: e.target.checked } })} />隐藏荐智标识</label>
           </div>
         </Field>
 

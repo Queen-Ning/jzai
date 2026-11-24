@@ -1,6 +1,8 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { DbService } from '../../../db/db.service';
 import { AppRegistryService } from './app-registry.service';
+import { isFirstPartyAppId } from '../first-party';
+import { isAppUsable } from '../app-state';
 
 export interface McpExposeRecord {
   appId: string;
@@ -22,9 +24,10 @@ export interface DeclaredExpose {
   note?: string;
 }
 
-/** 首方 APP：platformCapabilities 含 appstore:manage */
+/** 首方 APP：appId 为 io.jzai.* 且 platformCapabilities 含 appstore:manage（MC10） */
 export function isFirstPartyApp(manifest: any): boolean {
-  return (manifest?.platformCapabilities ?? []).includes('appstore:manage');
+  return isFirstPartyAppId(manifest?.appId)
+    && (manifest?.platformCapabilities ?? []).includes('appstore:manage');
 }
 
 /**
@@ -43,7 +46,8 @@ export class AppMcpExposeService {
 
   async isAllowed(appId: string): Promise<boolean> {
     const app = await this.registry.findOne(appId);
-    if (!app || app.status !== 'active') return false;
+    // MC11：授权只读期内的应用照常暴露（写入由应用自行拒绝），只读期满后不再暴露
+    if (!app || !isAppUsable(app)) return false;
     if (isFirstPartyApp(app.manifest)) return true;
     const row = await this.getRecord(appId);
     return row?.allowed === true;
@@ -64,9 +68,10 @@ export class AppMcpExposeService {
     return this.rowToRecord(rows[0]);
   }
 
-  /** 管理界面数据源：全部声明了 mcpExposed 的 active APP + 审批状态 */
+  /** 管理界面数据源：全部声明了 mcpExposed 的可用 APP（active，或授权只读期内）+ 审批状态 */
   async listDeclared(): Promise<DeclaredExpose[]> {
-    const apps = (await this.registry.findAll()).filter(a => a.status === 'active');
+    const now = Date.now();
+    const apps = (await this.registry.findAll()).filter(a => isAppUsable(a, now));
     const out: DeclaredExpose[] = [];
     for (const app of apps) {
       const toolIds = (app.manifest?.backend?.toolProviders ?? [])

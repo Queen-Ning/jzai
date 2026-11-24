@@ -71,6 +71,7 @@ describe('T2.4 HeadlessAgentRunner', () => {
         try {
           await bridge.requestConfirmation({
             confirmId: 'c1', toolName: '危险工具', args: {}, parameters: [],
+            userId: 'u1', sessionId: 'sched_task1_3',
           });
           yield { type: 'text_delta', text: '[不应到达]' };
         } catch {
@@ -86,9 +87,83 @@ describe('T2.4 HeadlessAgentRunner', () => {
     runner.onModuleInit();
     const fn = (taskRunner.registerAgentRunner as jest.Mock).mock.calls[0][0];
     const result = await fn(baseTask, 3);
-    expect(handleSpy).toHaveBeenCalledWith('c1', false);
+    expect(handleSpy).toHaveBeenCalledWith('c1', false, undefined, 'u1');
     expect(result.output).toContain('工具被拒绝');
     expect(result.output).not.toContain('[不应到达]');
+  });
+
+  // T-P-04-C08：只拒绝本次运行会话的请求，其他用户交互会话的确认保持挂起
+  it('C08：reject 模式只拒绝自己会话的请求；同时段 u2 交互会话的确认保持挂起', async () => {
+    const bridge = new ConfirmationBridgeService();
+    const taskRunner = { registerAgentRunner: jest.fn() } as unknown as TaskRunnerService;
+    let otherConfirm: Promise<unknown> | undefined;
+    let otherSettled = false;
+    const dynamicAgent = {
+      processMessage: jest.fn(() => (async function* () {
+        // 同一时段另一用户的交互确认先发出
+        otherConfirm = bridge.requestConfirmation({
+          confirmId: 'u2-confirm', toolName: '交互工具', args: {}, parameters: [],
+          userId: 'u2', sessionId: 'chat-session-u2',
+        });
+        otherConfirm.then(() => { otherSettled = true; }, () => { otherSettled = true; });
+        try {
+          await bridge.requestConfirmation({
+            confirmId: 'task-confirm', toolName: '危险工具', args: {}, parameters: [],
+            userId: 'u1', sessionId: 'sched_task1_5',
+          });
+        } catch (err: any) {
+          yield { type: 'text_delta', text: `拒绝：${err.message}` };
+        }
+        yield { type: 'done' };
+      })()),
+    } as any;
+    const runner = new HeadlessAgentRunner(dynamicAgent, taskRunner, bridge);
+    runner.onModuleInit();
+    const fn = (taskRunner.registerAgentRunner as jest.Mock).mock.calls[0][0];
+    const result = await fn(baseTask, 5);
+    expect(result.output).toBe('拒绝：user_cancelled');
+    await new Promise(r => setImmediate(r));
+    expect(otherSettled).toBe(false);
+    expect(bridge.pendingCount()).toBe(1);
+    // u2 自己回复后才完成
+    expect(bridge.handleReply('u2-confirm', true, { ok: 1 }, 'u2')).toBe(true);
+    await expect(otherConfirm).resolves.toEqual({ ok: 1 });
+    expect(bridge.events.listenerCount('confirm_request')).toBe(0);
+  });
+
+  // T-P-04-C09：以 runAsUser 作为回复者拒绝成功，运行不等待超时
+  it('C09：runAsUser=u1 → 以 u1 回复拒绝成功（handleReply 返回 true），不等超时', async () => {
+    const bridge = new ConfirmationBridgeService();
+    const replies: boolean[] = [];
+    const original = bridge.handleReply.bind(bridge);
+    jest.spyOn(bridge, 'handleReply').mockImplementation((...args: Parameters<typeof original>) => {
+      const ok = original(...args);
+      replies.push(ok);
+      return ok;
+    });
+    const taskRunner = { registerAgentRunner: jest.fn() } as unknown as TaskRunnerService;
+    const dynamicAgent = {
+      processMessage: jest.fn(() => (async function* () {
+        try {
+          await bridge.requestConfirmation({
+            confirmId: 'c9', toolName: '危险工具', args: {}, parameters: [],
+            userId: 'u1', sessionId: 'sched_task1_9', timeoutMs: 60_000,
+          });
+        } catch (err: any) {
+          yield { type: 'text_delta', text: err.message };
+        }
+        yield { type: 'done' };
+      })()),
+    } as any;
+    const runner = new HeadlessAgentRunner(dynamicAgent, taskRunner, bridge);
+    runner.onModuleInit();
+    const fn = (taskRunner.registerAgentRunner as jest.Mock).mock.calls[0][0];
+    const started = Date.now();
+    const result = await fn(baseTask, 9);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(replies).toEqual([true]);
+    expect(result.output).toBe('user_cancelled');
+    expect(bridge.pendingCount()).toBe(0);
   });
 
   it('用例3：skip_tool 模式——principal.scopes 含 confirm:skip_tool；reject 应答器未注册', async () => {

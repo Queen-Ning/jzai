@@ -17,7 +17,7 @@ import { APP_ARCHIVE_LIMITS } from './services/safe-archive.service';
 /**
  * Dev MCP facade（design-app-dev-mcp §3.2）。
  *
- * POST /api/dev/mcp — MCP JSON-RPC 端点（streamable-http 风格，initialize/tools/resources）。
+ * POST /api/dev/mcp — MCP JSON-RPC 端点（streamable-http 风格，initialize/tools/resources/prompts）。
  *   鉴权：Authorization: Bearer <dev-token>；默认关闭（system.json devMcp.enabled）。
  *   泛化自 /api/cw/mcp 的手写 JSON-RPC 模式，不引入 MCP SDK server。
  *
@@ -117,11 +117,11 @@ export class DevMcpController {
       throw new UnauthorizedException('Invalid or missing dev token');
     }
 
-    // 审计 principal 使用稳定 tokenId，绝不使用原始 token
+    // 审计 principal 使用稳定 tokenId，绝不使用原始 token；工具调用以签发人身份判定（MC01）
     const actorId = `dev-mcp:${verified.tokenId}`;
     const { id, method, params } = body ?? {};
     try {
-      const result = await this.dispatch(method, params ?? {}, actorId, verified.scopes);
+      const result = await this.dispatch(method, params ?? {}, actorId, verified.scopes, verified.issuedBy);
       return { jsonrpc: '2.0', id: id ?? null, result };
     } catch (err: any) {
       return {
@@ -138,12 +138,14 @@ export class DevMcpController {
     }
   }
 
-  private async dispatch(method: string, params: any, actorId: string, scopes: readonly string[]): Promise<unknown> {
+  private async dispatch(
+    method: string, params: any, actorId: string, scopes: readonly string[], issuedBy: string,
+  ): Promise<unknown> {
     switch (method) {
       case 'initialize':
         return {
           protocolVersion: '2024-11-05',
-          capabilities: { tools: {}, resources: {} },
+          capabilities: { tools: {}, resources: {}, prompts: {} },
           serverInfo: { name: 'jianzhi-dev-mcp', version: '1.0.0' },
         };
       case 'ping':
@@ -157,7 +159,7 @@ export class DevMcpController {
         if (/install|upgrade|uninstall|upload/i.test(String(params?.name ?? ''))) {
           this.requireScope(scopes, 'manage');
         }
-        const result = await this.devMcp.callTool(params.name, params.arguments ?? {}, actorId);
+        const result = await this.devMcp.callTool(params.name, params.arguments ?? {}, actorId, issuedBy);
         return {
           content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }],
         };
@@ -168,6 +170,13 @@ export class DevMcpController {
       case 'resources/read':
         this.requireScope(scopes, 'read');
         return { contents: [await this.devMcp.readResource(params.uri)] };
+      // MC14：首方包 prompts/*.md
+      case 'prompts/list':
+        this.requireScope(scopes, 'read');
+        return { prompts: await this.devMcp.listPrompts() };
+      case 'prompts/get':
+        this.requireScope(scopes, 'read');
+        return this.devMcp.getPrompt(params?.name, params?.arguments ?? {}, actorId, issuedBy);
       default:
         if (method?.startsWith('notifications/')) return null;
         throw new Error(`Method not supported: ${method}`);

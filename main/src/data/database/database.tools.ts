@@ -4,6 +4,7 @@ import { McpRegistryService } from '../../capability/mcp/mcp-registry.service';
 import { CredentialService } from '../../capability/skill/credential.service';
 import { ConfirmationBridgeService } from '../../agent/support/confirmation-bridge.service';
 import { validateNameForTool } from '../../utils/tool-name.validator';
+import { randomUUID } from 'crypto';
 
 @Injectable()
 export class DatabaseToolProvider implements ToolProvider {
@@ -31,7 +32,7 @@ export class DatabaseToolProvider implements ToolProvider {
     if (!Type) return [];
 
     return [
-      this.buildSaveDbConnection(Type),
+      this.buildSaveDbConnection(Type, ctx),
       this.buildTestDbConnection(Type),
       this.buildDiscoverDbSchema(Type),
       this.buildSearchDbSchema(Type),
@@ -39,7 +40,7 @@ export class DatabaseToolProvider implements ToolProvider {
   }
 
   // ===== save_db_connection =====
-  private buildSaveDbConnection(Type: any): ToolInstance {
+  private buildSaveDbConnection(Type: any, ctx: ToolContext): ToolInstance {
     return {
       name: 'save_db_connection',
       label: '保存数据库连接',
@@ -58,8 +59,11 @@ export class DatabaseToolProvider implements ToolProvider {
         // Confirm gate: show form for user to fill/verify DB connection details
         try {
           const editedArgs = await this.confirmBridge.requestConfirmation({
-            confirmId: `save_db_connection_${Date.now()}`,
+            confirmId: `save_db_connection_${Date.now()}_${randomUUID().slice(0, 8)}`,
             toolName: 'save_db_connection',
+            // MC04：确认只归属当前用户与会话
+            userId: ctx.userId ?? ctx.principal?.userId,
+            sessionId: ctx.sessionId,
             args,
             parameters: [
               { name: 'connection_name', type: 'string', required: true, description: '连接名称' },

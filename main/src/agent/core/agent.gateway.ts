@@ -170,6 +170,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       principal,
       oem,
     });
+    // MC07：按用户的推送房间（消息与待办的 inbox:changed 发到这里，同一用户的所有会话都收到）
+    client.join(`user:${user.id}`);
     this.analytics.registerUser(user.id, user.username || user.name);
     this.logger.log(`Connected: ${client.id} (${user.username || user.name})${oem ? ` [OEM ${oem.appId}]` : ''}`);
 
@@ -286,12 +288,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.analytics.recordEvent({ type: 'conversation_message', conversationId, userId, agentId, contentLength: content?.length || 0 }).catch(() => {});
     const startTime = Date.now();
 
-    // Listen for tool confirmation requests during this message processing
+    // Listen for tool confirmation requests during this message processing.
+    // MC04：只转发属于本用户、本会话的请求（不带 userId/sessionId 的旧请求保持广播）；
+    // 超时关闭只发给转发过该请求的会话，避免关掉其他用户的确认框
+    const forwardedConfirms = new Set<string>();
     const onConfirmRequest = (req: ConfirmRequest) => {
+      if (req.userId && req.userId !== userId) return;
+      if (req.sessionId && req.sessionId !== agentSessionId) return;
+      forwardedConfirms.add(req.confirmId);
       this.logger.log(`[EMIT] chat.confirm tool=${req.toolName} id=${req.confirmId}`);
-      client.emit('chat.confirm', { conversationId, ...req });
+      const timeoutSec = req.timeoutMs ? Math.round(req.timeoutMs / 1000) : undefined;
+      client.emit('chat.confirm', { conversationId, ...req, timeoutSec });
     };
     const onConfirmTimeout = (data: { confirmId: string }) => {
+      if (!forwardedConfirms.delete(data.confirmId)) return;
       this.logger.log(`[EMIT] chat.confirm_dismiss id=${data.confirmId}`);
       client.emit('chat.confirm_dismiss', { conversationId, confirmId: data.confirmId });
     };
@@ -407,11 +417,13 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('chat.confirm_reply')
   handleConfirmReply(
-    @ConnectedSocket() _client: Socket,
+    @ConnectedSocket() client: Socket,
     @MessageBody() data: { confirmId: string; confirmed: boolean; editedArgs?: Record<string, any> },
   ) {
-    this.logger.log(`chat.confirm_reply: id=${data.confirmId} confirmed=${data.confirmed}`);
-    this.confirmBridge.handleReply(data.confirmId, data.confirmed, data.editedArgs);
+    // MC04：回复者为本连接的用户（handleConnection 验证令牌后写入 socketUsers），由确认桥校验归属
+    const replierId = this.socketUsers.get(client.id)?.id;
+    this.logger.log(`chat.confirm_reply: id=${data.confirmId} confirmed=${data.confirmed} user=${replierId ?? '(none)'}`);
+    this.confirmBridge.handleReply(data.confirmId, data.confirmed, data.editedArgs, replierId);
   }
 
   /**

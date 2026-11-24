@@ -7,7 +7,7 @@ import { AppValidatorService } from '../validators/app-validator.service';
 import { AppRegistryService } from './app-registry.service';
 import { SafeArchiveService } from './safe-archive.service';
 import { PackageSignatureService } from './package-signature.service';
-import { FIRST_PARTY_APP_ID } from './app-platform.service';
+import { isFirstPartyAppId } from '../first-party';
 import {
   AppInstallOperationService,
   AppInstallOperationStatus,
@@ -70,9 +70,9 @@ export class AppStagingService {
         JSON.parse(fs.readFileSync(path.join(stageDir, 'manifest.json'), 'utf-8')),
       );
 
-      // 包签名验签：官方包（com.jianzhi.*/com.menhu.*）强制，第三方包无签名仅告警
+      // 包签名验签：首方包（io.jzai.*）强制，第三方包无签名仅告警
       const sigResult = this.signatures.verifyDirectory(stageDir);
-      const sigCheck = this.signatures.check(sigResult, FIRST_PARTY_APP_ID.test(manifest.appId));
+      const sigCheck = this.signatures.check(sigResult, isFirstPartyAppId(manifest.appId));
       if (!sigCheck.ok) {
         this.operations.fail(stageId, sigCheck.warning!);
         this.operations.clearStageDir(stageId);
