@@ -92,11 +92,12 @@ export class KbApiController {
     return { userId: user.id, permissions: user.role.permissions || [], token, isAdmin };
   }
 
-  private requirePermission(caller: Caller, perm: 'kb:read' | 'kb:write') {
-    if (!this.userService.hasPermission(caller.token, perm as any)) {
-      throw new ForbiddenException('权限不足');
-    }
-  }
+  /**
+   * 已废弃：知识库已独立为 APP，平台不再以 kb:read / kb:write 作为门禁。
+   * 访问控制由「应用授权」（能否打开面板）+「分类授权」（能看/改哪些分类）两层决定。
+   * 保留空实现以防遗漏调用点，全部调用已移除。
+   */
+  private requirePermission(_caller: Caller, _perm: 'kb:read' | 'kb:write') { /* no-op */ }
 
   /** 解析空间并校验可读；不可见 → 404（不暴露存在性） */
   private async resolveReadableSpace(kbId: string, caller: Caller): Promise<KbSpace> {
@@ -303,7 +304,6 @@ export class KbApiController {
   ) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:read');
     const space = await this.resolveReadableSpace(kbId, caller);
     const repo = new DocRepository(this.db);
     return repo.list({ path: docPath, spaceId: space.id, scopes: await this.scopesFor(caller), userId: caller.userId });
@@ -319,7 +319,6 @@ export class KbApiController {
   ) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:read');
     const space = await this.resolveReadableSpace(kbId, caller);
     if (!q || q.length < 1) return { detail: 'q is required' };
 
@@ -357,7 +356,6 @@ export class KbApiController {
   async getDocument(@Param('docId') docId: string, @Headers('authorization') auth: string) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:read');
     const doc = await this.getReadableDoc(docId, caller);
     if (!doc) throw new NotFoundException({ detail: 'Document not found' });
     return doc;
@@ -367,7 +365,6 @@ export class KbApiController {
   async getDocumentUrl(@Param('docId') docId: string, @Headers('authorization') auth: string) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:read');
     const doc = await this.getReadableDoc(docId, caller);
     if (!doc) throw new NotFoundException({ detail: 'Document not found' });
     const relative =
@@ -380,7 +377,6 @@ export class KbApiController {
   async getDocumentContent(@Param('docId') docId: string, @Headers('authorization') auth: string) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:read');
     const doc = await this.getReadableDoc(docId, caller);
     if (!doc) throw new NotFoundException({ detail: 'Document not found' });
     const { rows } = await this.db.query(
@@ -428,7 +424,6 @@ export class KbApiController {
   ) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:write');
     const space = await this.resolveReadableSpace(kbId, caller);
     this.requireWritable(space, caller);
     // 个人空间本人不受分类授权约束；企业空间按路径解析分类并校验「新增」权限
@@ -524,7 +519,6 @@ export class KbApiController {
   ) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:write');
     const { rows: docRows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
     const doc = docRows[0];
     if (!doc) throw new NotFoundException({ detail: 'Document not found' });
@@ -556,7 +550,6 @@ export class KbApiController {
   ) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:write');
     const { rows: docRows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
     const doc = docRows[0];
     if (!doc) throw new NotFoundException({ detail: 'Document not found' });
@@ -601,7 +594,6 @@ export class KbApiController {
   async deleteDocument(@Param('docId') docId: string, @Headers('authorization') auth: string, @Res() res: express.Response) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:write');
     const { rows: docRows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
     const doc = docRows[0];
     if (!doc) throw new NotFoundException({ detail: 'Document not found' });
@@ -617,7 +609,6 @@ export class KbApiController {
   async bulkDelete(@Body() body: { ids?: string[] }, @Headers('authorization') auth: string, @Res() res: express.Response) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:write');
     const ids = body?.ids || [];
     for (const docId of ids) {
       const { rows: docRows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
@@ -645,7 +636,6 @@ export class KbApiController {
   ) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:write');
     if (!file?.buffer || !file.originalname) {
       throw new NotFoundException({ detail: 'No filename' });
     }
@@ -758,7 +748,6 @@ export class KbApiController {
   async serveFile(@Req() req: express.Request, @Res() res: express.Response, @Headers('authorization') auth: string) {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
-    this.requirePermission(caller, 'kb:read');
 
     // Express 5：从 URL 派生通配段
     const idx = req.path.indexOf('/v1/files/');

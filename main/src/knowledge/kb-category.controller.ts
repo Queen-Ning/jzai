@@ -24,7 +24,14 @@ export class KbCategoryController {
     private readonly spaces: SpacesService,
   ) {}
 
+  /**
+   * 已废弃：知识库已独立为 APP，平台不再以 kb:read / kb:write 作为门禁。
+   * 能否打开面板由「应用授权」决定，能看/改哪些分类由「分类授权」决定，
+   * 分类内的写与管理边界走 requireCategoryAdmin / requireCategoryWritable。
+   * sys:admin 这类平台级权限仍然照常校验。
+   */
   private requirePermission(req: any, perm: Permission) {
+    if (perm === 'kb:read' || perm === 'kb:write') return;
     const token = (req.headers?.authorization || '').replace('Bearer ', '');
     if (!token || !this.userService.hasPermission(token, perm)) throw new ForbiddenException('权限不足');
   }
@@ -230,7 +237,9 @@ export class KbSynonymController {
     private readonly userService: UserService,
   ) {}
 
+  /** 同 KbCategoryController：kb:* 不再作为门禁，见那边的说明。 */
   private requirePermission(req: any, perm: Permission) {
+    if (perm === 'kb:read' || perm === 'kb:write') return;
     const token = (req.headers?.authorization || '').replace('Bearer ', '');
     if (!token || !this.userService.hasPermission(token, perm)) throw new ForbiddenException('权限不足');
   }
