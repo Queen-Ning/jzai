@@ -38,12 +38,3 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
-
-# 随安装包分发的插件（resources/extensions/*）需要入库：
-# 内网客户装不了 npm，插件和它的依赖必须跟着客户端走。
-# 注意 dist/ 规则会误伤依赖包自己的编译产物（axios、dingtalk-stream 都在 dist 下），
-# 这里逐层把目录重新纳入，否则提交出来的插件是残缺的。
-!resources/extensions/*/node_modules/
-!resources/extensions/*/node_modules/**/node_modules/
-!resources/extensions/*/node_modules/**/dist/
-!resources/extensions/*/dist/

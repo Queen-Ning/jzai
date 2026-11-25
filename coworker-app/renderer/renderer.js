@@ -954,9 +954,14 @@ ipcRenderer.on('dingtalk-login-qrcode', (event, { url }) => {
 });
 
 // 平台已保存配置 + gateway 重启中
-ipcRenderer.on('dingtalk-login-success', (event, { version } = {}) => {
+ipcRenderer.on('dingtalk-login-success', (event, { version, pluginReady, pluginError } = {}) => {
   addLog('钉钉机器人绑定成功', 'success');
   setDingtalkStatus(version ? `授权成功（配置版本 v${version}），正在重启运行时…` : '授权成功，正在重启运行时…');
+
+  // 插件是绑定时按需安装的，装不上不影响绑定，但要让人知道通道暂时连不上
+  if (pluginReady === false) {
+    addLog(`钉钉通道插件未安装：${pluginError || '原因未知'}`, 'warn');
+  }
 
   setTimeout(async () => {
     hideDingtalkLogin();

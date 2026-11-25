@@ -173,7 +173,8 @@ const getExtensionsPath = () => {
  */
 const BUNDLED_EXTENSIONS = [
   { id: 'jianzhi-bridge', marker: 'plugin.js' },
-  { id: 'dingtalk-connector', marker: path.join('dist', 'index.mjs') },
+  // dingtalk-connector 不再随包分发（19MB，绝大多数用户用不到）。
+  // 绑定钉钉时由 ensureDingtalkPlugin() 按需安装，见 completeDingtalkBinding。
 ];
 
 // Token 配置文件路径（用于自动激活）
@@ -1254,7 +1255,7 @@ function createWindow() {
   });
 
   // 等待窗口加载完成后启动 gateway
-  mainWindow.webContents.on('did-finish-load', () => {
+  mainWindow.webContents.on('did-finish-load', async () => {
     perfMetrics.mark('window-ready');
     perfMetrics.measure('window-creation', 'create-window-start', 'window-ready');
     perfMetrics.measure('app-to-ready', 'app-start', 'window-ready');
@@ -1271,6 +1272,15 @@ function createWindow() {
       perfMetrics.mark('gateway-start-request');
       // 每次启动都刷新打包插件，OTA 装完的修复才能真正落到 ~/.openclaw/extensions
       refreshBundledExtensions();
+      // 钉钉插件不再随包分发：已经绑过通道但插件丢了（换机器 / 清过用户目录）时补装。
+      // 只在确实配过通道时才尝试，且下载失败也不影响 gateway 起来。
+      if (isDingtalkChannelConfigured()) {
+        try {
+          await ensureDingtalkPlugin();
+        } catch (err) {
+          console.warn('[DingTalk] 启动补装插件失败:', err.message);
+        }
+      }
       console.log('[PERF] 启动 Gateway');
       startGateway();
     }
@@ -1685,7 +1695,147 @@ async function putDingtalkChannelConfig(body) {
   }
 }
 
+/** 钉钉通道是否已配置过（决定启动时要不要补装插件） */
+function isDingtalkChannelConfigured() {
+  try {
+    const p = getOpenClawJsonPath();
+    if (!fs.existsSync(p)) return false;
+    const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const ch = cfg && cfg.channels && cfg.channels['dingtalk-connector'];
+    return !!ch;
+  } catch (err) {
+    console.warn('[DingTalk] 读取配置判断通道状态失败:', err.message);
+    return false;
+  }
+}
+
+/** 现场可改的插件来源：<userData>/dingtalk-plugin.json 里的 {"url": "..."} */
+function dingtalkPluginConfigUrl() {
+  try {
+    const p = path.join(app.getPath('userData'), 'dingtalk-plugin.json');
+    if (!fs.existsSync(p)) return '';
+    const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return String((cfg && cfg.url) || '').trim();
+  } catch (err) {
+    console.warn('[DingTalk] 读取 dingtalk-plugin.json 失败:', err.message);
+    return '';
+  }
+}
+
+/** 带重定向的下载，落到指定路径 */
+function downloadToFile(url, destPath) {
+  return new Promise((resolve, reject) => {
+    const follow = (u, depth = 0) => {
+      if (depth > 5) return reject(new Error('重定向次数过多'));
+      const mod = u.startsWith('https') ? require('https') : require('http');
+      mod.get(u, res => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          return follow(res.headers.location, depth + 1);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`下载失败 HTTP ${res.statusCode}`));
+        }
+        const out = fs.createWriteStream(destPath);
+        res.pipe(out);
+        out.on('finish', () => out.close(resolve));
+        out.on('error', reject);
+      }).on('error', reject);
+    };
+    follow(url);
+  });
+}
+
+/** 解压 tar.gz 到目标目录（Windows 10+ 自带 bsdtar） */
+function extractTarGz(tarPath, destDir) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('tar', ['-xzf', tarPath, '-C', destDir], {
+      windowsHide: true,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let err = '';
+    child.stderr.on('data', d => { err += d.toString(); });
+    child.on('error', reject);
+    child.on('close', code => {
+      if (code === 0) resolve();
+      else reject(new Error(`解压失败(${code}): ${err.slice(0, 200)}`));
+    });
+  });
+}
+
+/**
+ * 按需安装钉钉插件。
+ *
+ * 插件不随安装包分发（19MB / 2400+ 文件，绝大多数客户用不到），只有真正要用
+ * 钉钉通道时才装。来源按顺序尝试，任一成功即止：
+ *   1. 已经装在 ~/.openclaw/extensions/dingtalk-connector → 直接用
+ *   2. 安装包内压缩兜底 resources/extensions/dingtalk-connector.tar.gz（打了才走这条）
+ *   3. 环境变量 DINGTALK_PLUGIN_URL 指向的 tar.gz
+ *   4. <userData>/dingtalk-plugin.json 里的 { "url": "..." }（现场运维可改，不用重新打包）
+ * 全失败抛错，由调用方决定是否中断（绑定流程不中断，只提示）。
+ */
+async function ensureDingtalkPlugin() {
+  const extensionsDir = getExtensionsPath();
+  const target = path.join(extensionsDir, 'dingtalk-connector');
+  const marker = path.join(target, 'dist', 'index.mjs');
+  if (fs.existsSync(marker)) return true;
+
+  const resourcesPath = process.resourcesPath || path.join(__dirname, '..', 'resources');
+  const bundledTar = path.join(resourcesPath, 'extensions', 'dingtalk-connector.tar.gz');
+
+  // 去重：同一个地址可能既来自环境变量又来自配置文件
+  const seen = new Set();
+  const sources = [];
+  const push = (kind, value) => {
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    sources.push({ kind, value });
+  };
+  if (fs.existsSync(bundledTar)) push('file', bundledTar);
+  push('url', String(process.env.DINGTALK_PLUGIN_URL || '').trim());
+  push('url', dingtalkPluginConfigUrl());
+
+  if (sources.length === 0) {
+    throw new Error(
+      '钉钉插件未安装，且没有可用来源。可任选一种：设置环境变量 DINGTALK_PLUGIN_URL 指向 tar.gz；' +
+      '在 ' + path.join(app.getPath('userData'), 'dingtalk-plugin.json') + ' 里写 {"url":"..."}；' +
+      '或把插件解压到 ' + target
+    );
+  }
+
+  fs.mkdirSync(extensionsDir, { recursive: true });
+  let lastErr = null;
+
+  for (const src of sources) {
+    let tmpTar = null;
+    try {
+      let tarPath = src.value;
+      if (src.kind === 'url') {
+        console.log('[DingTalk] 下载插件:', src.value);
+        tmpTar = path.join(app.getPath('temp'), `dingtalk-connector-${Date.now()}.tar.gz`);
+        await downloadToFile(src.value, tmpTar);
+        tarPath = tmpTar;
+      }
+      await extractTarGz(tarPath, extensionsDir);
+      if (!fs.existsSync(marker)) throw new Error('解压后未找到 dist/index.mjs，压缩包结构不对');
+      console.log('[DingTalk] 插件安装完成，来源:', src.kind === 'file' ? src.value : src.value);
+      return true;
+    } catch (err) {
+      lastErr = err;
+      console.error('[DingTalk] 插件安装失败:', src.value, err.message);
+      // 半成品目录会让下次判定踩到 marker，直接清掉重来
+      try { fs.rmSync(target, { recursive: true, force: true }); } catch (_) {}
+    } finally {
+      if (tmpTar) { try { fs.rmSync(tmpTar, { force: true }); } catch (_) {} }
+    }
+  }
+
+  throw new Error('钉钉插件安装失败：' + (lastErr?.message || '未知错误'));
+}
+
 /** init → begin → 推送二维码，轮询在后台继续 */
+
 async function startDingtalkLogin() {
   if (dingtalkLoginSession) {
     throw new Error('已有钉钉授权流程进行中，请先取消');
@@ -1813,6 +1963,15 @@ async function pollDingtalkUntilDone(session, deviceCode, intervalSeconds, timeo
 /** 扫码成功后：先落平台，成功才通知界面并重启 gateway */
 async function completeDingtalkBinding({ clientId, clientSecret }) {
   try {
+    // 插件缺失不该挡住绑定：凭据已经拿到，通道配置先落库，插件可以在下次启动继续补装。
+    let pluginError = null;
+    try {
+      await ensureDingtalkPlugin();
+    } catch (pluginErr) {
+      pluginError = pluginErr.message;
+      console.warn('[DingTalk Login] 插件安装未完成，绑定继续:', pluginErr.message);
+    }
+
     const result = await putDingtalkChannelConfig({
       enabled: true,
       clientId,
@@ -1821,7 +1980,11 @@ async function completeDingtalkBinding({ clientId, clientSecret }) {
       groupReplyMode: 'markdown',
     });
     console.log('[DingTalk Login] 平台已保存钉钉通道配置 version=', result.version);
-    sendToRenderer('dingtalk-login-success', { version: result.version || null });
+    sendToRenderer('dingtalk-login-success', {
+      version: result.version || null,
+      pluginReady: !pluginError,
+      pluginError,
+    });
     try {
       await restartGatewayInternal();
     } catch (restartError) {
