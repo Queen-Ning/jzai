@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import * as path from 'path';
 import { DbService } from '../../db/db.service';
 import { WorkspaceService } from '../../workspace/workspace.service';
 import { loadKnowledgeConfig, KnowledgeConfig } from '../knowledge.config';
@@ -179,6 +180,11 @@ export class KnowledgeToolsService implements OnModuleInit {
   private knowledgeLayerCache = new Map<string, { value: string | null; expiry: number }>();
   private static readonly KNOWLEDGE_LAYER_CACHE_TTL_MS = 5 * 60 * 1000;
 
+  // 工具写入的分类路径解析缓存（同一批工具调用内避免重复查库）
+  private categoryPathCache = new Map<string, { id: string | null; expiry: number }>();
+  private enterpriseSpaceIdCache: { id: string; expiry: number } | null = null;
+  private static readonly CATEGORY_PATH_CACHE_TTL_MS = 30 * 1000;
+
   constructor(
     private readonly db: DbService,
     private readonly workspace: WorkspaceService,
@@ -247,7 +253,7 @@ export class KnowledgeToolsService implements OnModuleInit {
   private async resolveVault(
     knowledgeBase: string | undefined,
     callCtx?: KnowledgeCallContext,
-  ): Promise<{ space: KbSpace; fs: VaultFS; scopes: Set<string> | null; writable: boolean } | null> {
+  ): Promise<{ space: KbSpace; fs: VaultFS; scopes: Set<string> | null; writable: boolean; userId: string; isAdmin: boolean } | null> {
     const space = await this.spaces.resolve(knowledgeBase || ENTERPRISE_SPACE_SLUG);
     if (!space) return null;
 
@@ -255,7 +261,14 @@ export class KnowledgeToolsService implements OnModuleInit {
     // APP 身份：仅对自有 APP 空间追加写权限；其余空间回落到用户语义判定
     // （APP agent 常以用户身份操作企业空间，如 wiki_compiler 编译入 ent-default）
     if (callCtx?.appId && space.type === 'app' && space.owner_app_id === callCtx.appId) {
-      return { space, fs: this.vaultFs.forSpace(space, this.spaces.rootFor(space.slug), userId), scopes: null, writable: true };
+      return {
+        space,
+        fs: this.vaultFs.forSpace(space, this.spaces.rootFor(space.slug), userId),
+        scopes: null,
+        writable: true,
+        userId,
+        isAdmin: false,
+      };
     }
 
     const isAdmin = userId ? await this.kbAccess.isAdmin(userId) : false;
@@ -274,26 +287,170 @@ export class KnowledgeToolsService implements OnModuleInit {
     }
 
     const writable = this.spaces.canWrite(space, userId, isAdmin);
-    return { space, fs, scopes, writable };
+    return { space, fs, scopes, writable, userId, isAdmin };
+  }
+
+  /**
+   * 按目标路径校验分类级写权限（智能体 write / delete 工具用）。
+   * - 管理员 → true
+   * - /wiki/_personal/ → true（个人空间按 userId 隔离，文件系统层已限制）
+   * - 写 /wiki/pending/ 且无来源路径 → 登录用户即可（知识建议箱，非正式知识）
+   * - 写 /wiki/_drafts/ 或 /wiki/pending/ 且带来源路径 → 按来源路径的分类判权（编译场景，多来源需全部满足）
+   * - 否则按目标路径判权；解析不到分类 → false（非管理员不可写未分类）
+   * - write 需 editor/admin，delete 需 admin
+   */
+  private async checkPathWritable(
+    targetPath: string,
+    userId: string,
+    isAdmin: boolean,
+    action: 'write' | 'delete',
+    sourcePath?: string | string[],
+  ): Promise<boolean> {
+    if (isAdmin) return true;
+
+    const raw = String(targetPath || '').replace(/\\/g, '/');
+    if (raw.startsWith('/wiki/_personal/') || raw.startsWith('wiki/_personal/')) return true;
+
+    const target = this.normalizeToolPath(raw);
+    if (!target) return false;
+
+    const sources = (Array.isArray(sourcePath) ? sourcePath : sourcePath ? [sourcePath] : [])
+      .map((p) => this.normalizeToolPath(p))
+      .filter((p): p is string => !!p);
+
+    // 知识建议箱：pending 下无来源路径时，登录用户即可提交（正式写入仍需分类角色）
+    if (action === 'write' && sources.length === 0 && target.startsWith('/wiki/pending/')) {
+      return !!userId;
+    }
+    if (!userId) return false;
+
+    // 编译草稿：目标本身不挂分类，按来源 raw 目录的分类判权
+    const useSource = sources.length > 0
+      && (target.startsWith('/wiki/_drafts/') || target.startsWith('/wiki/pending/'));
+    const classifyPaths = useSource ? sources : [target];
+
+    const spaceId = await this.getEnterpriseSpaceId();
+    if (!spaceId) return false;
+
+    const scopes = await this.kbAccess.getAccessibleScopesWithRole(userId);
+    if (scopes === 'ADMIN_ALL') return true;
+
+    for (const classifyPath of classifyPaths) {
+      const categoryId = await this.resolveCategoryIdByToolPath(classifyPath, spaceId);
+      if (!categoryId) return false;
+      const hit = scopes.find((s) => s.categoryId === categoryId);
+      if (!hit) return false;
+      const ok = action === 'delete'
+        ? hit.role === 'admin'
+        : hit.role === 'editor' || hit.role === 'admin';
+      if (!ok) return false;
+    }
+    return true;
+  }
+
+  /** 工具路径规范化：统一分隔符、归一化 . / ..，返回以 / 开头的绝对路径；非法返回 null */
+  private normalizeToolPath(p: string): string | null {
+    const raw = String(p || '').replace(/\\/g, '/');
+    const normalized = path.posix.normalize('/' + raw.replace(/^\/+/, ''));
+    const segments = normalized.split('/').filter((s) => s.length > 0);
+    if (segments.includes('..')) return null;
+    return '/' + segments.join('/') + (segments.length > 0 ? '/' : '');
+  }
+
+  /** 分类 path 最长前缀匹配（带 30s 缓存，避免同批工具调用重复查库） */
+  private async resolveCategoryIdByToolPath(toolPath: string, spaceId: string): Promise<string | null> {
+    const segments = toolPath.split('/').filter((s) => s.length > 0);
+    if (segments.length > 0 && ['wiki', 'raw', 'sources'].includes(segments[0])) segments.shift();
+    if (segments.length === 0) return null;
+    const categoryPath = '/' + segments.join('/');
+
+    const key = `${spaceId}:${categoryPath}`;
+    const cached = this.categoryPathCache.get(key);
+    if (cached && cached.expiry > Date.now()) return cached.id;
+
+    let found: string | null = null;
+    for (let i = segments.length; i > 0; i--) {
+      const candidate = '/' + segments.slice(0, i).join('/');
+      const { rows } = await this.db.query(
+        'SELECT id FROM jz_kb_categories WHERE path = $1 AND space_id = $2',
+        [candidate, spaceId],
+      );
+      if (rows.length > 0) {
+        found = String(rows[0].id);
+        break;
+      }
+    }
+    this.categoryPathCache.set(key, {
+      id: found,
+      expiry: Date.now() + KnowledgeToolsService.CATEGORY_PATH_CACHE_TTL_MS,
+    });
+    return found;
+  }
+
+  private async getEnterpriseSpaceId(): Promise<string | null> {
+    if (this.enterpriseSpaceIdCache && this.enterpriseSpaceIdCache.expiry > Date.now()) {
+      return this.enterpriseSpaceIdCache.id;
+    }
+    const space = await this.spaces.resolve(ENTERPRISE_SPACE_SLUG);
+    if (!space) return null;
+    this.enterpriseSpaceIdCache = {
+      id: space.id,
+      expiry: Date.now() + KnowledgeToolsService.CATEGORY_PATH_CACHE_TTL_MS,
+    };
+    return space.id;
+  }
+
+  /** APP 空间（自有）与个人空间不参与分类授权（前者按 appId、后者按属主隔离） */
+  private isCategoryExemptSpace(space: KbSpace): boolean {
+    return space.type === 'app' || space.subtype === 'personal';
+  }
+
+  /** 编译来源目录集合（去重）；用于按来源分类判权 */
+  private distinctSourceDirs(sources: any[]): string[] {
+    const dirs = new Set<string>();
+    for (const d of sources) {
+      const p = String(d?.path || '').replace(/\\/g, '/');
+      if (p) dirs.add(p);
+    }
+    return [...dirs];
+  }
+
+  /** 目录 → 分类可读名（用于跳过提示）；解析不到分类时退化为目录路径 */
+  private async categoryLabelForDir(dir: string): Promise<string> {
+    const spaceId = await this.getEnterpriseSpaceId();
+    if (!spaceId) return dir;
+    const categoryId = await this.resolveCategoryIdByToolPath(dir, spaceId);
+    if (!categoryId) return dir;
+    const { rows } = await this.db.query('SELECT name FROM jz_kb_categories WHERE id = $1', [categoryId]);
+    return rows[0]?.name || dir;
   }
 
   // ── 内部工具执行 ────────────────────────────────────────────────────────
 
   /**
    * 执行内部知识库工具（替代原 MCP callTool）。
+   * internalOpts 仅供本文件内部调用（如 compile_wiki 传入来源路径），不接受外部入参。
    */
   async callInternalTool(
     name: string,
     args: Record<string, any>,
     callCtx?: KnowledgeCallContext,
+    internalOpts?: { sourcePath?: string; sourcePaths?: string[] },
   ): Promise<string> {
     if (name === 'ping') return 'pong';
+
+    // 防绕过：外部参数里的 __sourcePath 一律丢弃（来源路径只能由内部代码经 internalOpts 注入）
+    if (args && typeof args === 'object' && Object.prototype.hasOwnProperty.call(args, '__sourcePath')) {
+      const { __sourcePath: _dropped, ...rest } = args;
+      args = rest;
+    }
+    const sourcePath = internalOpts?.sourcePaths ?? internalOpts?.sourcePath;
 
     const resolved = await this.resolveVault(args?.knowledge_base, callCtx);
     if (!resolved) {
       return `Knowledge base '${args?.knowledge_base || ENTERPRISE_SPACE_SLUG}' not found.`;
     }
-    const { space, fs, scopes, writable } = resolved;
+    const { space, fs, scopes, writable, userId, isAdmin } = resolved;
     const ctx = this.handlerCtx();
 
     try {
@@ -323,6 +480,10 @@ export class KnowledgeToolsService implements OnModuleInit {
         }
         case 'write': {
           if (!writable) return 'Error: 该空间为只读（无写权限）。';
+          if (!this.isCategoryExemptSpace(space)
+            && !(await this.checkPathWritable(args.path, userId, isAdmin, 'write', sourcePath))) {
+            return 'Error: 无权修改该分类下的内容。';
+          }
           const handler = new WriteHandler(ctx, fs, space);
           if (args.command === 'create') {
             result = await handler.create(args.path || '/', args.title || '', args.content || '', args.tags ?? [], args.date_str || '', args.overwrite || false);
@@ -338,6 +499,10 @@ export class KnowledgeToolsService implements OnModuleInit {
         }
         case 'delete': {
           if (!writable) return 'Error: 该空间为只读（无写权限）。';
+          if (!this.isCategoryExemptSpace(space)
+            && !(await this.checkPathWritable(args.path, userId, isAdmin, 'delete'))) {
+            return 'Error: 无权删除该分类下的内容。';
+          }
           const handler = new DeleteHandler(fs, space);
           result = await handler.delete(args.path);
           if (args.path?.startsWith('/wiki/')) this.invalidateKnowledgeLayerCache();
@@ -510,10 +675,12 @@ export class KnowledgeToolsService implements OnModuleInit {
             focus: { type: 'string', description: '可选：只处理指定文件名的文档' },
           },
         },
-        execute: async (_id: string, params: { focus?: string }) => {
+        execute: async (_id: string, params: { focus?: string }, ctx?: KnowledgeCallContext) => {
           this.logger.log('compile_wiki: starting');
 
-          const resolved = await this.resolveVault(ENTERPRISE_SPACE_SLUG, { scopes: 'ADMIN_ALL' });
+          // 以调用者身份解析（读按分类 ACL 过滤、写按调用者角色判定）；不再硬编码 ADMIN_ALL
+          const callCtx = { userId: ctx?.userId, userEmail: ctx?.userEmail, scopes: ctx?.scopes };
+          const resolved = await this.resolveVault(ENTERPRISE_SPACE_SLUG, callCtx);
           if (!resolved) {
             return { content: [{ type: 'text', text: '企业心智未初始化。' }] };
           }
@@ -526,6 +693,33 @@ export class KnowledgeToolsService implements OnModuleInit {
             return { content: [{ type: 'text', text: '没有可处理的来源文档。请先上传文档到企业心智。' }] };
           }
 
+          // 编译前按来源目录过滤：只编译调用者可编辑的分类；其余跳过并提示（管理员不筛）
+          const skippedLabels: string[] = [];
+          if (!resolved.isAdmin) {
+            const allowedDirs = new Set<string>();
+            const skipped = new Set<string>();
+            for (const dir of this.distinctSourceDirs(sources)) {
+              if (await this.checkPathWritable(dir, resolved.userId, resolved.isAdmin, 'write')) {
+                allowedDirs.add(dir);
+              } else {
+                const label = await this.categoryLabelForDir(dir);
+                if (!skipped.has(label)) {
+                  skipped.add(label);
+                  skippedLabels.push(label);
+                }
+              }
+            }
+            if (allowedDirs.size === 0) {
+              return { content: [{ type: 'text', text: '无权编译任何来源（当前账号在这些分类下没有编辑权限）。' }] };
+            }
+            sources = sources.filter((d: any) =>
+              allowedDirs.has(String(d.path || '').replace(/\\/g, '/')),
+            );
+          }
+
+          // 编译写入 /wiki/_drafts/（本身不挂分类），按来源 raw 目录的分类判权
+          const sourcePaths = this.distinctSourceDirs(sources);
+
           const summaries: string[] = [];
           for (const doc of sources.slice(0, 15)) {
             try {
@@ -533,7 +727,7 @@ export class KnowledgeToolsService implements OnModuleInit {
                 knowledge_base: ENTERPRISE_SPACE_SLUG,
                 path: doc.filename,
                 pages: '1-3',
-              });
+              }, callCtx);
               summaries.push(`- **${doc.title || doc.filename}** (${doc.page_count || '?'}p): ${text.substring(0, 200)}`);
             } catch {
               summaries.push(`- **${doc.title || doc.filename}**: [读取失败]`);
@@ -570,7 +764,7 @@ export class KnowledgeToolsService implements OnModuleInit {
               knowledge_base: ENTERPRISE_SPACE_SLUG, command: 'create',
               path: '/wiki/_drafts/', title: 'overview.md',
               content: overviewContent, tags: ['overview'], overwrite: true,
-            });
+            }, callCtx, { sourcePaths });
             results.push('✅ /wiki/overview.md');
             this.logger.log('compile_wiki: wrote overview.md');
           } catch (e: any) {
@@ -599,7 +793,7 @@ export class KnowledgeToolsService implements OnModuleInit {
               knowledge_base: ENTERPRISE_SPACE_SLUG, command: 'create',
               path: '/wiki/_drafts/', title: 'log.md',
               content: logContent, tags: ['log'], overwrite: true,
-            });
+            }, callCtx, { sourcePaths });
             results.push('✅ /wiki/log.md');
             this.logger.log('compile_wiki: wrote log.md');
           } catch (e: any) {
@@ -612,6 +806,9 @@ export class KnowledgeToolsService implements OnModuleInit {
               '',
               `已处理 ${sources.length} 篇来源文档:`,
               ...results,
+              ...(skippedLabels.length > 0
+                ? ['', `已跳过 ${skippedLabels.length} 个无权编辑的分类：${skippedLabels.join('、')}`]
+                : []),
               '',
               '基础页面已生成到 /wiki/_drafts/ 目录，待管理员审核后发布。',
               '你可以继续让我为企业心智生成更多概念页和实体页。',
@@ -632,7 +829,7 @@ export class KnowledgeToolsService implements OnModuleInit {
           },
           required: ['content', 'type'],
         },
-        execute: async (_id: string, params: any) => {
+        execute: async (_id: string, params: any, ctx?: KnowledgeCallContext) => {
           const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
           const pagePath = `/wiki/pending/${params.category || params.type}/${timestamp}.md`;
           const pageContent = `---\ntags: [${params.type}, pending]\ncategory: ${params.category || '未分类'}\n---\n\n${params.content}`;
@@ -644,7 +841,7 @@ export class KnowledgeToolsService implements OnModuleInit {
             content: pageContent,
             tags: [params.type, 'pending'],
             overwrite: true,
-          });
+          }, { userId: ctx?.userId, userEmail: ctx?.userEmail, scopes: ctx?.scopes });
           return { content: [{ type: 'text', text: text || '已提交知识建议，等待审核。' }] };
         },
       },

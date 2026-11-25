@@ -1,7 +1,7 @@
 import {
   Controller, Get, Post, Put, Patch, Delete, Body, Param, Query, Req, Res,
   Headers, ForbiddenException, UnauthorizedException, NotFoundException,
-  UseInterceptors, UploadedFile, Logger,
+  BadRequestException, UseInterceptors, UploadedFile, Logger,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { SkipThrottle } from '@nestjs/throttler';
@@ -29,6 +29,15 @@ const NEEDS_PROCESSING = new Set([
   'pdf', 'pptx', 'ppt', 'docx', 'doc', 'xlsx', 'xls', 'html', 'htm',
   'png', 'jpg', 'jpeg', 'webp', 'gif',
 ]);
+
+/** 上传白名单（扩展名，小写、不含点） */
+const ALLOWED_UPLOAD_EXTS = new Set([
+  'md', 'txt', 'pdf', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'csv',
+  'png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'html', 'htm', 'json', 'xml',
+]);
+
+/** 上传体积上限 20MB */
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 
 const MIME: Record<string, string> = {
   '.md': 'text/markdown; charset=utf-8',
@@ -102,6 +111,90 @@ export class KbApiController {
     if (!this.spaces.canWrite(space, caller.userId, caller.isAdmin)) {
       throw new ForbiddenException({ detail: '该空间为只读' });
     }
+  }
+
+  /**
+   * 分类级写校验。
+   * - 管理员 → 放行
+   * - 未分类（null）→ 仅管理员可写（fail-closed）
+   * - admin → 放行
+   * - editor → 仅允许「改内容 / 改名 / 移动」(mutate)，拒绝新增 / 上传 / 删除
+   * - viewer / 无授权 → 全部拒绝
+   */
+  private async requireCategoryWritable(
+    categoryId: string | null,
+    caller: Caller,
+    action: 'mutate' | 'create' | 'delete' = 'mutate',
+  ): Promise<void> {
+    if (caller.isAdmin) return;
+    if (!categoryId) {
+      throw new ForbiddenException({ detail: '未分类文档仅管理员可写' });
+    }
+    const scopes = await this.kbAccess.getAccessibleScopesWithRole(caller.userId);
+    if (scopes === 'ADMIN_ALL') return;
+    const hit = scopes.find((s) => s.categoryId === String(categoryId));
+    const allowed =
+      !!hit &&
+      (hit.role === 'admin' || (hit.role === 'editor' && action === 'mutate'));
+    if (!allowed) {
+      throw new ForbiddenException({
+        detail: action === 'mutate' ? '无编辑权限' : '无新增/删除权限',
+      });
+    }
+  }
+
+  /**
+   * 文档级写校验：空间可写 + （个人空间本人例外）+ 分类级角色校验。
+   */
+  private async requireDocWritable(
+    doc: any,
+    space: KbSpace | null,
+    caller: Caller,
+    action: 'mutate' | 'create' | 'delete',
+  ): Promise<void> {
+    if (!space) throw new NotFoundException({ detail: 'Knowledge base not found' });
+    this.requireWritable(space, caller);
+    // 个人空间：本人对自己空间的文档拥有完全写权限（无分类概念）
+    if (space.subtype === 'personal' && doc.owner_user_id === caller.userId) return;
+    await this.requireCategoryWritable(doc.category_id ?? null, caller, action);
+  }
+
+  /** 去掉 raw/ wiki/ sources/ 首段，得到与 jz_kb_categories.path 对齐的分类路径 */
+  private normalizeCategoryPath(docPath: string | null | undefined): string | null {
+    if (!docPath) return null;
+    const segments = String(docPath).split('/').filter((s) => s.length > 0);
+    if (segments.length > 0 && ['wiki', 'raw', 'sources'].includes(segments[0])) {
+      segments.shift();
+    }
+    if (segments.length === 0) return null;
+    return '/' + segments.join('/');
+  }
+
+  /** 按分类 path 最长前缀匹配出 categoryId；匹配不到返回 null */
+  private async resolveCategoryIdByPath(spaceId: string, docPath: string | null | undefined): Promise<string | null> {
+    const normalized = this.normalizeCategoryPath(docPath);
+    if (!normalized || !spaceId) return null;
+    const segments = normalized.split('/').filter((s) => s.length > 0);
+    for (let i = segments.length; i > 0; i--) {
+      const candidate = '/' + segments.slice(0, i).join('/');
+      const { rows } = await this.db.query(
+        'SELECT id FROM jz_kb_categories WHERE path = $1 AND space_id = $2',
+        [candidate, spaceId],
+      );
+      if (rows.length > 0) return String(rows[0].id);
+    }
+    return null;
+  }
+
+  /** 文件名校验与净化：去掉路径分隔符与控制字符 */
+  private sanitizeFilename(name: string): string {
+    const cleaned = String(name || '')
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\u0000-\u001F\u007F]/g, '')
+      .replace(/[\\/]/g, '')
+      .replace(/^\.+$/, '')
+      .trim();
+    return cleaned;
   }
 
   private async scopesFor(caller: Caller): Promise<Set<string> | null> {
@@ -306,16 +399,23 @@ export class KbApiController {
     const { rows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
     const doc = rows[0];
     if (!doc) return null;
+    return (await this.canReadDocRecord(doc, caller)) ? doc : null;
+  }
+
+  /**
+   * 文档记录读权限（读路径与文件下载共用同一口径）：
+   * 空间可读 + 管理员/所有者直接放行 + 其余按 category_id 走分类授权；
+   * 未分类（category_id 为 NULL）对非管理员视为无授权。
+   */
+  private async canReadDocRecord(doc: any, caller: Caller): Promise<boolean> {
     const space = await this.spaces.resolve(doc.space_id);
-    if (!space || !this.spaces.canRead(space, caller.userId, caller.isAdmin)) return null;
-    if (!caller.isAdmin && doc.owner_user_id !== caller.userId) {
-      const scopes = await this.kbAccess.getAccessibleScopesForUser(caller.userId);
-      // 未分类（category_id 为 NULL）同样视为无授权，不再默认放行
-      if (scopes !== 'ADMIN_ALL' && (!doc.category_id || !scopes.includes(String(doc.category_id)))) {
-        return null;
-      }
-    }
-    return doc;
+    if (!space || !this.spaces.canRead(space, caller.userId, caller.isAdmin)) return false;
+    if (caller.isAdmin) return true;
+    if (doc.owner_user_id === caller.userId) return true;
+    if (!doc.category_id) return false;
+    const scopes = await this.kbAccess.getAccessibleScopesForUser(caller.userId);
+    if (scopes === 'ADMIN_ALL') return true;
+    return scopes.includes(String(doc.category_id));
   }
 
   // ── 文档写 ──────────────────────────────────────────────────────────────
@@ -331,6 +431,14 @@ export class KbApiController {
     this.requirePermission(caller, 'kb:write');
     const space = await this.resolveReadableSpace(kbId, caller);
     this.requireWritable(space, caller);
+    // 个人空间本人不受分类授权约束；企业空间按路径解析分类并校验「新增」权限
+    if (!(space.subtype === 'personal' && space.owner_user_id === caller.userId)) {
+      await this.requireCategoryWritable(
+        await this.resolveCategoryIdByPath(space.id, body?.path || '/'),
+        caller,
+        'create',
+      );
+    }
     return this.createNote(space, caller, body);
   }
 
@@ -381,14 +489,16 @@ export class KbApiController {
 
     const sourceKind = dirPath.replace(/^\//, '').startsWith('wiki') ? 'wiki' : 'source';
     const ownerId = space.subtype === 'personal' ? caller.userId : null;
+    // 建档即回填分类：否则文档一创建就是「未分类」，非管理员后续编辑/删除会被判为无权限
+    const categoryId = await this.resolveCategoryIdByPath(space.id, dirPath);
 
     const docId = crypto.randomUUID();
     await this.db.query(
       'INSERT INTO jz_kb_documents ' +
         '(id, owner_user_id, filename, title, path, relative_path, source_kind, ' +
-        "file_type, status, content, tags, version, space_id) " +
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, 'md', 'ready', $8, $9, 0, $10)",
-      [docId, ownerId, finalFilename, title, dirPath, relative, sourceKind, content, tags, space.id],
+        "file_type, status, content, tags, version, space_id, category_id) " +
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, 'md', 'ready', $8, $9, 0, $10, $11)",
+      [docId, ownerId, finalFilename, title, dirPath, relative, sourceKind, content, tags, space.id, categoryId],
     );
 
     if (content) {
@@ -415,10 +525,11 @@ export class KbApiController {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
     this.requirePermission(caller, 'kb:write');
-    const doc = await this.getReadableDoc(docId, caller);
+    const { rows: docRows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
+    const doc = docRows[0];
     if (!doc) throw new NotFoundException({ detail: 'Document not found' });
     const space = await this.spaces.resolve(doc.space_id);
-    this.requireWritable(space!, caller);
+    await this.requireDocWritable(doc, space, caller, 'mutate');
 
     const content = body.content ?? '';
     const fp = this.docDiskPath(space!, doc);
@@ -446,10 +557,26 @@ export class KbApiController {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
     this.requirePermission(caller, 'kb:write');
-    const doc = await this.getReadableDoc(docId, caller);
+    const { rows: docRows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
+    const doc = docRows[0];
     if (!doc) throw new NotFoundException({ detail: 'Document not found' });
     const space = await this.spaces.resolve(doc.space_id);
-    this.requireWritable(space!, caller);
+    await this.requireDocWritable(doc, space, caller, 'mutate');
+
+    // 改名/移动：目标目录同样需要可写（editor 允许移动，但不得移入无授权分类）
+    const targetDirs = [
+      body?.path,
+      body?.relative_path ? String(body.relative_path).replace(/[^/]*$/, '/') : null,
+    ].filter((d) => d && d !== doc.path);
+    if (!(space!.subtype === 'personal' && doc.owner_user_id === caller.userId)) {
+      for (const dir of [...new Set(targetDirs)]) {
+        await this.requireCategoryWritable(
+          await this.resolveCategoryIdByPath(space!.id, dir),
+          caller,
+          'mutate',
+        );
+      }
+    }
 
     const sets: string[] = [];
     const params: any[] = [];
@@ -475,15 +602,14 @@ export class KbApiController {
     const caller = await this.resolveCaller(auth);
     if (!caller) throw new UnauthorizedException();
     this.requirePermission(caller, 'kb:write');
-    const doc = await this.getReadableDoc(docId, caller);
-    if (doc) {
-      const space = await this.spaces.resolve(doc.space_id);
-      this.requireWritable(space!, caller);
-      const fp = this.docDiskPath(space!, doc);
-      if (fp && fs.existsSync(fp)) fs.unlinkSync(fp);
-    }
-    const r = await this.db.query("UPDATE jz_kb_documents SET status = 'archived' WHERE id = $1", [docId]);
-    if (r.rowCount === 0) throw new NotFoundException({ detail: 'Document not found' });
+    const { rows: docRows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
+    const doc = docRows[0];
+    if (!doc) throw new NotFoundException({ detail: 'Document not found' });
+    const space = await this.spaces.resolve(doc.space_id);
+    await this.requireDocWritable(doc, space, caller, 'delete');
+    const fp = this.docDiskPath(space!, doc);
+    if (fp && fs.existsSync(fp)) fs.unlinkSync(fp);
+    await this.db.query("UPDATE jz_kb_documents SET status = 'archived' WHERE id = $1", [docId]);
     return res.status(204).send();
   }
 
@@ -494,13 +620,13 @@ export class KbApiController {
     this.requirePermission(caller, 'kb:write');
     const ids = body?.ids || [];
     for (const docId of ids) {
-      const doc = await this.getReadableDoc(docId, caller);
-      if (doc) {
-        const space = await this.spaces.resolve(doc.space_id);
-        this.requireWritable(space!, caller);
-        const fp = this.docDiskPath(space!, doc);
-        if (fp && fs.existsSync(fp)) fs.unlinkSync(fp);
-      }
+      const { rows: docRows } = await this.db.query('SELECT * FROM jz_kb_documents WHERE id = $1', [docId]);
+      const doc = docRows[0];
+      if (!doc) continue;
+      const space = await this.spaces.resolve(doc.space_id);
+      await this.requireDocWritable(doc, space, caller, 'delete');
+      const fp = this.docDiskPath(space!, doc);
+      if (fp && fs.existsSync(fp)) fs.unlinkSync(fp);
     }
     if (ids.length > 0) {
       await this.db.query('DELETE FROM jz_kb_documents WHERE id = ANY($1)', [ids]);
@@ -511,7 +637,7 @@ export class KbApiController {
   // ── 上传 ────────────────────────────────────────────────────────────────
 
   @Post('v1/upload')
-  @UseInterceptors(FileInterceptor('file'))
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_UPLOAD_BYTES } }))
   async upload(
     @UploadedFile() file: any,
     @Body() body: { path?: string; space?: string },
@@ -528,15 +654,37 @@ export class KbApiController {
     this.requireWritable(space, caller);
 
     // multer/busboy 默认 defParamCharset=latin1，浏览器发来的 UTF-8 文件名会被误解码，需转回
-    const filename = Buffer.from(file.originalname, 'latin1').toString('utf8');
-    const dirParam = (body?.path || '/').trim() || '/';
-    const relative = `${dirParam.replace(/\/$/, '')}/${filename}`.replace(/^\//, '');
+    const filename = this.sanitizeFilename(Buffer.from(file.originalname, 'latin1').toString('utf8'));
+    if (!filename) throw new BadRequestException({ detail: '非法文件名' });
+
+    const ext = filename.includes('.') ? filename.split('.').pop()!.toLowerCase() : '';
+    if (!ext || !ALLOWED_UPLOAD_EXTS.has(ext)) {
+      throw new BadRequestException({ detail: `不支持的文件类型: ${ext || '(无扩展名)'}` });
+    }
+
+    // 路径规范化：去掉 ..，且必须落在 /raw/ 下
+    const dirParam = (body?.path || '/raw/').trim() || '/raw/';
+    const normalized = path.posix.normalize(`${dirParam.replace(/\/$/, '')}/${filename}`).replace(/^\/+/, '');
+    if (normalized.split('/').includes('..')) {
+      throw new BadRequestException({ detail: '非法路径' });
+    }
+    if (!('/' + normalized).startsWith('/raw/')) {
+      throw new BadRequestException({ detail: '上传路径必须位于 /raw/ 下' });
+    }
+    const relative = normalized;
+
+    // 分类级写校验（个人空间本人例外）；未分类上传仅管理员可写
+    let categoryId: string | null = null;
+    if (!(space.subtype === 'personal' && space.owner_user_id === caller.userId)) {
+      categoryId = await this.resolveCategoryIdByPath(space.id, relative);
+      await this.requireCategoryWritable(categoryId, caller, 'create');
+    }
+
     const dest = this.safeResolve(this.spaces.rootFor(space.slug), relative);
     fs.mkdirSync(path.dirname(dest), { recursive: true });
     const contentBytes: Buffer = file.buffer;
     fs.writeFileSync(dest, contentBytes);
 
-    const ext = filename.includes('.') ? filename.split('.').pop()!.toLowerCase() : '';
     const title = titleFromFilename(filename);
     const dirPath = relative.includes('/')
       ? `/${relative.split('/').slice(0, -1).join('/')}/`
@@ -560,27 +708,42 @@ export class KbApiController {
     const { rows } = await this.db.query(
       'INSERT INTO jz_kb_documents (id, filename, title, path, relative_path, ' +
         'source_kind, file_type, file_size, status, content, content_hash, ' +
-        'mtime_ns, last_indexed_at, space_id, owner_user_id) ' +
-        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13, $14) ' +
+        'mtime_ns, last_indexed_at, space_id, owner_user_id, category_id) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), $13, $14, $15) ' +
         'ON CONFLICT (space_id, relative_path) DO UPDATE SET ' +
         'filename = EXCLUDED.filename, title = EXCLUDED.title, ' +
         'file_size = EXCLUDED.file_size, status = EXCLUDED.status, ' +
         'content = EXCLUDED.content, content_hash = EXCLUDED.content_hash, ' +
-        'mtime_ns = EXCLUDED.mtime_ns, updated_at = NOW() ' +
+        'mtime_ns = EXCLUDED.mtime_ns, category_id = EXCLUDED.category_id, ' +
+        'owner_user_id = EXCLUDED.owner_user_id, error_message = NULL, ' +
+        'version = jz_kb_documents.version + 1, updated_at = NOW() ' +
         'RETURNING id',
       [
         docId, filename, title, dirPath, relative, sourceKind,
         ext || 'bin', contentBytes.length,
-        textContent !== null ? 'ready' : 'pending',
+        textContent !== null ? 'processing' : 'pending',
         textContent, contentHash, mtimeNs,
-        space.id,
-        space.subtype === 'personal' ? caller.userId : null,
+        space.id, caller.userId, categoryId,
       ],
     );
     const finalDocId = rows[0].id;
 
-    if (textContent) {
-      await new ChunkRepository(this.db).storeChunks(finalDocId, chunkText(textContent));
+    if (textContent !== null) {
+      // 文本类：先切块，成功后再置 ready；失败写 failed + error_message
+      try {
+        await new ChunkRepository(this.db).storeChunks(finalDocId, chunkText(textContent));
+        await this.db.query(
+          "UPDATE jz_kb_documents SET status = 'ready', error_message = NULL, last_indexed_at = NOW(), updated_at = NOW() WHERE id = $1",
+          [finalDocId],
+        );
+      } catch (e: any) {
+        const msg = String(e?.message || e).slice(0, 2000);
+        this.logger.error(`Chunking failed for ${finalDocId}: ${msg}`);
+        await this.db.query(
+          "UPDATE jz_kb_documents SET status = 'failed', error_message = $2, updated_at = NOW() WHERE id = $1",
+          [finalDocId, msg],
+        );
+      }
     } else if (NEEDS_PROCESSING.has(ext)) {
       this.processor.enqueue(finalDocId);
     }
@@ -604,6 +767,14 @@ export class KbApiController {
 
     const filePath = this.resolveFileKey(key, caller);
     if (!filePath) throw new NotFoundException({ detail: 'File not found' });
+
+    // 分类级读校验：非管理员必须能按文档 category_id 读到该记录（与 getReadableDoc 同口径）
+    if (!caller.isAdmin) {
+      const doc = await this.findDocForFile(filePath, key);
+      if (!doc || !(await this.canReadDocRecord(doc, caller))) {
+        throw new ForbiddenException({ detail: '无权访问该文件' });
+      }
+    }
 
     const stat = fs.statSync(filePath);
     const ext = path.extname(filePath).toLowerCase();
@@ -643,6 +814,33 @@ export class KbApiController {
       ETag: etag,
     });
     return fs.createReadStream(filePath).pipe(res);
+  }
+
+  /**
+   * 由文件 key + 命中磁盘路径反查文档记录（用于下载时的分类级权限校验）。
+   * 只有当磁盘路径确实等于「该文档所属空间根 + relative_path」时才认定，避免跨空间同名文件误判。
+   */
+  private async findDocForFile(filePath: string, key: string): Promise<any | null> {
+    const candidates = new Set<string>();
+    if (key.startsWith('spaces/')) {
+      const parts = key.split('/');
+      if (parts.length > 2) candidates.add(parts.slice(2).join('/'));
+    }
+    candidates.add(key);
+
+    for (const rel of candidates) {
+      const { rows } = await this.db.query(
+        "SELECT * FROM jz_kb_documents WHERE relative_path = $1 AND status != 'archived' ORDER BY created_at DESC",
+        [rel],
+      );
+      for (const doc of rows) {
+        const space = await this.spaces.resolve(doc.space_id);
+        if (!space) continue;
+        const root = path.resolve(this.spaces.rootFor(space.slug));
+        if (filePath === path.resolve(root, rel)) return doc;
+      }
+    }
+    return null;
   }
 
   /**

@@ -33,9 +33,13 @@ export class KnowledgeToolProvider implements ToolProvider {
     // kb_mcp: raw knowledge tools for wiki_compiler
     // T2/P3：APP agent 经 ctx.appId 注入 APP 身份（自有 APP 空间可写；企业/个人空间只读）
     try {
-      const rawTools = await this.knowledgeTools.getRawMcpTools(
-        ctx.appId ? { appId: ctx.appId, userId: ctx.userId, userEmail: ctx.userEmail } : undefined,
-      );
+      // 始终透传调用者身份：无 appId 时也要携带 userId/userEmail，
+      // 否则写入类工具拿不到用户角色会被 fail-closed 拒绝（管理员也不例外）
+      const rawTools = await this.knowledgeTools.getRawMcpTools({
+        appId: ctx.appId,
+        userId: ctx.userId,
+        userEmail: ctx.userEmail,
+      });
       tools.push(...rawTools.map((rt: any) => ({
         name: rt.name, label: rt.description, description: rt.description, parameters: rt.parameters,
         execute: async (toolCallId: string, args: any) => {

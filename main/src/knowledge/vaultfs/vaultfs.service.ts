@@ -136,19 +136,39 @@ export class VaultFS {
       if (u.rows.length > 0) ownerId = this.ownerUserId;
     }
 
+    // 建档即回填分类（智能体 write 工具走这里）；否则编译产物会变成「未分类」，编辑无法再改
+    const categoryId = await this.resolveCategoryIdByDir(dirPath);
+
     await this.db.query(
       'INSERT INTO jz_kb_documents ' +
         '(id, owner_user_id, filename, title, path, relative_path, source_kind, ' +
-        'file_type, status, content, tags, date, metadata, version, space_id) ' +
-        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready', $9, $10, $11, $12::jsonb, 0, $13)",
+        'file_type, status, content, tags, date, metadata, version, space_id, category_id) ' +
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready', $9, $10, $11, $12::jsonb, 0, $13, $14)",
       [
         docId, ownerId, filename, title, dirPath, relativePath, sourceKind,
         fileType, content, tags, date,
         metadata ? JSON.stringify(metadata) : null,
         this.spaceId,
+        categoryId,
       ],
     );
     return { id: docId, filename, path: dirPath };
+  }
+
+  /** 按目录路径最长前缀匹配本空间的分类 ID；解析不到返回 null */
+  private async resolveCategoryIdByDir(dirPath: string): Promise<string | null> {
+    const segments = String(dirPath || '').split('/').filter(Boolean);
+    if (segments.length > 0 && ['wiki', 'raw', 'sources'].includes(segments[0])) segments.shift();
+    if (segments.length === 0) return null;
+    for (let i = segments.length; i > 0; i--) {
+      const candidate = '/' + segments.slice(0, i).join('/');
+      const { rows } = await this.db.query(
+        'SELECT id FROM jz_kb_categories WHERE path = $1 AND space_id = $2',
+        [candidate, this.spaceId],
+      );
+      if (rows.length > 0) return String(rows[0].id);
+    }
+    return null;
   }
 
   async updateDocument(

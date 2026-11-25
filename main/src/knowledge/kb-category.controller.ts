@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Put, Delete, Body, Param, Req, ForbiddenException, Logger } from '@nestjs/common';
+import { Controller, Get, Post, Put, Delete, Body, Param, Req, ForbiddenException, UnauthorizedException, Logger } from '@nestjs/common';
 import { SkipThrottle } from '@nestjs/throttler';
 import { DbService } from '../db/db.service';
 import { UserService, Permission } from '../user/user.service';
@@ -40,6 +40,23 @@ export class KbCategoryController {
   private async enterpriseSpaceId(): Promise<string> {
     const space = await this.spaces.resolve(ENTERPRISE_SPACE_SLUG);
     return space!.id;
+  }
+
+  /**
+   * 分类级管理边界：全局管理员（sys:admin / kb:admin）或对该分类有 admin 角色才允许。
+   * 用于授权、撤权、删除分类等「管理」动作，避免普通用户给自己授 admin / 删除整棵分类树。
+   */
+  private async requireCategoryAdmin(req: any, categoryId: string): Promise<{ userId: string }> {
+    const caller = this.resolveCaller(req);
+    if (!caller) throw new UnauthorizedException();
+    if (await this.kbAccess.isAdmin(caller.userId)) return caller;
+    const scopes = await this.kbAccess.getAccessibleScopesWithRole(caller.userId);
+    if (scopes === 'ADMIN_ALL') return caller;
+    const hit = scopes.find((s) => s.categoryId === String(categoryId));
+    if (!hit || hit.role !== 'admin') {
+      throw new ForbiddenException('需要分类管理员权限');
+    }
+    return caller;
   }
 
   // ===== Categories CRUD =====
@@ -122,7 +139,7 @@ export class KbCategoryController {
 
   @Delete(':id')
   async deleteCategory(@Req() req: any, @Param('id') id: string) {
-    this.requirePermission(req, 'kb:write');
+    await this.requireCategoryAdmin(req, id);
     await this.db.query('DELETE FROM jz_kb_categories WHERE id = $1', [id]);
     return { deleted: true };
   }
@@ -173,7 +190,7 @@ export class KbCategoryController {
   async grantAccess(@Req() req: any, @Param('id') id: string, @Body() body: {
     grantee_type: 'department' | 'workgroup' | 'user'; grantee_id: string; role?: string;
   }) {
-    this.requirePermission(req, 'kb:write');
+    await this.requireCategoryAdmin(req, id);
     const aid = crypto.randomUUID();
     await this.db.query(
       `INSERT INTO jz_kb_category_access (id, category_id, grantee_type, grantee_id, role)
@@ -186,9 +203,20 @@ export class KbCategoryController {
 
   @Delete(':catId/access/:accessId')
   async revokeAccess(@Req() req: any, @Param('catId') catId: string, @Param('accessId') accessId: string) {
-    this.requirePermission(req, 'kb:write');
+    await this.requireCategoryAdmin(req, catId);
     await this.db.query('DELETE FROM jz_kb_category_access WHERE id = $1 AND category_id = $2', [accessId, catId]);
     return { deleted: true };
+  }
+
+  /** 当前用户在该分类上的继承后最高角色；管理员恒为 admin，无授权为 null。 */
+  @Get(':id/my-role')
+  async getMyRole(@Req() req: any, @Param('id') id: string) {
+    const caller = this.resolveCaller(req);
+    if (!caller) throw new UnauthorizedException();
+    const scopes = await this.kbAccess.getAccessibleScopesWithRole(caller.userId);
+    if (scopes === 'ADMIN_ALL') return { role: 'admin' };
+    const hit = scopes.find((s) => s.categoryId === String(id));
+    return { role: hit ? hit.role : null };
   }
 }
 
