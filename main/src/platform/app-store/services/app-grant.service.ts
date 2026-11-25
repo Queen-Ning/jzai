@@ -113,6 +113,12 @@ export class AppGrantService {
     for (const row of res.rows) {
       const key = listOf[row.targetType as GrantTargetType];
       if (!key) continue;
+      // 授权对象已被删除（用户/角色/部门不存在）：这一行对谁都不生效，界面上只能把 id 当名字显示。
+      // 直接跳过，别把 UUID 摆到授权列表里。存量脏数据由 deleteUser 的级联清理兜住。
+      if (!row.targetName) {
+        this.logger.warn(`App ${appId} 权限 ${row.permissionId} 指向已删除的 ${row.targetType}:${row.targetId}，已从授权列表跳过`);
+        continue;
+      }
       let summary = summaries.get(row.permissionId) ?? undeclared.get(row.permissionId);
       if (!summary) {
         summary = {

@@ -368,9 +368,37 @@ export class UserService implements OnModuleInit {
     });
   }
 
+  /**
+   * 删除用户。
+   *
+   * 这几张授权表用 target_id / grantee_id 存多态引用，没有外键约束，
+   * `DELETE FROM jz_users` 不会级联，留下的是「指向已不存在用户」的孤儿行：
+   * 授权页只能把 id 当名字显示（截图里那串 UUID 就是这么来的），
+   * 而授权本身对谁都无效。所以删用户时顺手把授权一起清掉。
+   * 表可能不存在（老版本库），单条失败不影响删除本身。
+   */
   async deleteUser(id: string): Promise<boolean> {
+    await this.purgeUserGrants(id);
     const { rowCount } = await this.db.query('DELETE FROM jz_users WHERE id=$1', [id]);
     return (rowCount || 0) > 0;
+  }
+
+  private async purgeUserGrants(userId: string): Promise<void> {
+    const statements: Array<[string, string]> = [
+      ['jz_app_grants', "DELETE FROM jz_app_grants WHERE target_type='user' AND target_id=$1"],
+      ['jz_resource_grants', "DELETE FROM jz_resource_grants WHERE target_type='user' AND target_id=$1"],
+      ['jz_kb_category_access', "DELETE FROM jz_kb_category_access WHERE grantee_type='user' AND grantee_id=$1"],
+      ['jz_user_sidebar', 'DELETE FROM jz_user_sidebar WHERE user_id=$1'],
+      ['jz_department_members', 'DELETE FROM jz_department_members WHERE user_id=$1'],
+      ['jz_workgroup_members', 'DELETE FROM jz_workgroup_members WHERE user_id=$1'],
+    ];
+    for (const [table, sql] of statements) {
+      try {
+        await this.db.query(sql, [userId]);
+      } catch (err: any) {
+        this.logger.warn(`删除用户 ${userId} 时清理 ${table} 失败: ${err?.message ?? err}`);
+      }
+    }
   }
 
   private mapRole(row: any): Role {
